@@ -396,7 +396,7 @@ async function fetchStatus() {
     document.getElementById('chartBadge').textContent = data.testnet ? 'TESTNET' : 'LIVE';
 
     startBalance = bal;
-    addLog('INFO', `Balance: $${bal?.toFixed(2)} | P&L: ${pnlStr} | Trades: ${data.trades_today}`);
+    addLog('INFO', `Balance: ${bal != null ? '$'+bal.toFixed(2) : '—'} | P&L: ${pnlStr} | Trades: ${data.trades_today}`);
     return data;
   } catch (e) {
     addLog('ERROR', `Hors ligne — impossible de joindre ${BOT_URL}`);
