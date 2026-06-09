@@ -253,7 +253,8 @@ def get_rsi(closes: list, period: int = 14) -> float:
     return round(100 - (100 / (1 + avg_gain / avg_loss)), 2)
 
 # ─── CACHES ──────────────────────────────────────────────────
-_fg_cache  = {"value": None, "ts": 0}
+_fg_cache   = {"value": None, "ts": 0}
+_dom_cache  = {"value": None, "ts": 0}
 _bal_cache = {"value": 0.0,  "ts": 0}
 
 def get_fear_greed() -> dict:
@@ -269,6 +270,32 @@ def get_fear_greed() -> dict:
         return result
     except:
         return _fg_cache["value"] or {"value": 50, "label": "Neutral"}
+
+def get_usdt_dominance() -> dict:
+    """Dominance USDT sur le marché crypto — signal macro secondaire (cache 10min)."""
+    now = time.time()
+    if now - _dom_cache["ts"] < 600 and _dom_cache["value"]:
+        return _dom_cache["value"]
+    try:
+        r = http.get("https://api.coingecko.com/api/v3/global", timeout=8)
+        data = r.json().get("data", {})
+        dom_pct = data.get("market_cap_percentage", {}).get("usdt", 0)
+        # Variation 24h du marché total pour détecter si dominance monte/descend
+        mkt_change = data.get("market_cap_change_percentage_24h_usd", 0)
+        # Interprétation : dominance >7% = beaucoup de cash stablecoin = bearish
+        if dom_pct > 8:
+            label = "BEARISH_MACRO"   # fuite vers stablecoins
+        elif dom_pct > 6:
+            label = "NEUTRE"
+        else:
+            label = "BULLISH_MACRO"   # peu de stablecoins = appétit pour le risque
+        result = {"pct": round(dom_pct, 2), "label": label, "mkt_change_24h": round(mkt_change, 2)}
+        _dom_cache["value"] = result
+        _dom_cache["ts"]    = now
+        return result
+    except:
+        return _dom_cache["value"] or {"pct": 6.0, "label": "NEUTRE", "mkt_change_24h": 0}
+
 
 def get_balance() -> float:
     now     = time.time()
@@ -680,6 +707,7 @@ def ask_ai_multi(contexts: list, perf: dict = None) -> dict:
     fg        = contexts[0]["fear_greed_value"]
     trending  = get_trending_coins()
     perf      = perf or {"n": 0, "summary": "Aucun historique"}
+    dom       = get_usdt_dominance()
 
     cands_text = ""
     for ctx in contexts:
@@ -714,7 +742,7 @@ def ask_ai_multi(contexts: list, perf: dict = None) -> dict:
     prompt = f"""Tu es un trader algorithmique expert qui prend des decisions rapides et rentables ({datetime.now().strftime('%H:%M UTC')}).
 
 PORTEFEUILLE:
-- Capital: ${balance} | Fear&Greed: {fg}/100 ({contexts[0]['fear_greed_label']})
+- Capital: ${balance} | Fear&Greed: {fg}/100 ({contexts[0]['fear_greed_label']}) | USDT Dominance: {dom['pct']}% ({dom['label']}, marché 24h: {dom['mkt_change_24h']:+.1f}%)
 - Trending: {', '.join(trending[:5]) if trending else 'N/A'}
 - Positions ouvertes: {len(state['open_exits'])}/{MAX_OPEN_POSITIONS} | Pertes consecutives: {state['loss_streak']}
 
@@ -729,6 +757,7 @@ REGLES ESSENTIELLES:
 - SELL/SHORT: prefere RSI > 25, biais 4h non BULLISH | {short_note}
 - SHORT: stop_loss SUPERIEUR a entry, take_profit INFERIEUR a entry
 - Apprends de l'historique: si beaucoup de pertes recentes, sois plus selectif; si bon win_rate, trade plus librement
+- USDT Dominance (signal macro secondaire, pas décisif): si BEARISH_MACRO préfère les SELL/SHORT; si BULLISH_MACRO préfère les BUY — mais n'ignore pas un bon setup technique contraire
 - HOLD seulement si vraiment rien de convaincant — prends les opportunites
 
 ACTIONS: BUY (long spot), SELL (short futures), HOLD
