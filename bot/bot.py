@@ -862,10 +862,10 @@ def risk_gate(decision: dict, context: dict, min_conf: float = None) -> tuple:
     if action == "SELL" and rsi < 20:
         return False, f"RSI trop survendu ({rsi} < 20) pour shorter"
 
-    # Volume minimal (assoupli : 0.3x)
+    # Volume minimal (0.05x — testnet a peu de volume)
     vol_ratio = context.get("volume_ratio", 1.0)
-    if vol_ratio < 0.3:
-        return False, f"Volume trop faible ({vol_ratio}x < 0.3x)"
+    if vol_ratio < 0.05:
+        return False, f"Volume trop faible ({vol_ratio}x < 0.05x)"
 
     # R:R minimum 1.5 — auto-corriger le TP plutôt que rejeter
     if entry and sl and tp:
@@ -877,11 +877,18 @@ def risk_gate(decision: dict, context: dict, min_conf: float = None) -> tuple:
             log.info(f"Risk Gate: TP auto-corrigé {tp:.6g} → {new_tp:.6g} (R:R forcé 1.5)")
             decision["take_profit"] = new_tp
 
-    # SL max 3.5% (assoupli depuis 2.5%)
+    # SL max 2.5% — auto-corriger si trop loin plutôt que rejeter
     if entry and sl:
         sl_pct = abs(entry - sl) / entry * 100
-        if sl_pct > 3.5:
-            return False, f"SL trop loin ({sl_pct:.2f}% > 3.5%)"
+        if sl_pct > 2.5:
+            new_sl = (entry * 0.975) if action == "BUY" else (entry * 1.025)
+            log.info(f"Risk Gate: SL auto-corrigé {sl:.6g} → {new_sl:.6g} ({sl_pct:.1f}% → 2.5%)")
+            decision["stop_loss"] = new_sl
+            # Recalculer TP pour maintenir R:R 1.5
+            risk   = abs(entry - new_sl)
+            new_tp = (entry + risk * 1.5) if action == "BUY" else (entry - risk * 1.5)
+            decision["take_profit"] = new_tp
+            log.info(f"Risk Gate: TP recalculé → {new_tp:.6g} (R:R 1.5)")
 
     return True, "OK"
 
@@ -978,7 +985,7 @@ def sync_open_positions():
         if not oco_id:
             continue
         try:
-            oco    = binance.get_order_list(orderListId=int(oco_id))
+            oco    = binance._get("orderList", True, data={"orderListId": int(oco_id)})
             status = oco.get("listOrderStatus", "")
             if status not in ("ALL_DONE", "RESPONSE"):
                 continue
