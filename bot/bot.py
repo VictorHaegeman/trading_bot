@@ -57,13 +57,15 @@ SCRIPT_DIR = Path(__file__).parent
 env_path   = SCRIPT_DIR / ".env"
 load_dotenv(dotenv_path=env_path)
 
-TESTNET          = os.getenv("TESTNET", "true").lower() != "false"
-BINANCE_API_KEY  = os.getenv("BINANCE_API_KEY", "").strip()
-BINANCE_SECRET   = os.getenv("BINANCE_SECRET", "").strip()
-GROQ_API_KEY     = os.getenv("GROQ_API_KEY", "").strip()
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-TWITTER_BEARER   = os.getenv("TWITTER_BEARER_TOKEN", "").strip()
+TESTNET              = os.getenv("TESTNET", "true").lower() != "false"
+BINANCE_API_KEY      = os.getenv("BINANCE_API_KEY", "").strip()
+BINANCE_SECRET       = os.getenv("BINANCE_SECRET", "").strip()
+BINANCE_FUTURES_KEY  = os.getenv("BINANCE_FUTURES_KEY", BINANCE_API_KEY).strip()
+BINANCE_FUTURES_SEC  = os.getenv("BINANCE_FUTURES_SECRET", BINANCE_SECRET).strip()
+GROQ_API_KEY         = os.getenv("GROQ_API_KEY", "").strip()
+TELEGRAM_TOKEN       = os.getenv("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID     = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TWITTER_BEARER       = os.getenv("TWITTER_BEARER_TOKEN", "").strip()
 
 # Ignore placeholder values
 if TELEGRAM_TOKEN and ("COLLE" in TELEGRAM_TOKEN or len(TELEGRAM_TOKEN) < 20):
@@ -72,15 +74,16 @@ if TELEGRAM_CHAT_ID and "COLLE" in TELEGRAM_CHAT_ID:
     TELEGRAM_CHAT_ID = ""
 
 # Parametres de risque
-MAX_TRADE_PCT         = 0.10    # 10% du capital par trade (max 10 positions simultanées)
-DAILY_LOSS_CAP        = 0.04    # Pause si -4% dans la journee
+MAX_TRADE_PCT         = 0.10
+DAILY_LOSS_CAP        = 0.05    # Pause si -5% dans la journee
 CAPITAL_LIMIT_USDT    = float(os.getenv("CAPITAL_LIMIT_USDT", "1000"))
-MAX_DAILY_TRADES      = int(os.getenv("MAX_DAILY_TRADES", "12"))   # 12 trades/jour max
-MAX_LOSS_STREAK       = int(os.getenv("MAX_LOSS_STREAK", "3"))     # pause apres 3 pertes consecutives
-MIN_CONFIDENCE        = float(os.getenv("MIN_CONFIDENCE", "0.65"))
-MAX_OPEN_POSITIONS    = int(os.getenv("MAX_OPEN_POSITIONS", "8"))  # max positions simultanées
-ALL_SYMBOLS_MIN_VOL   = float(os.getenv("ALL_SYMBOLS_MIN_VOL", "50000"))   # vol 24h min en USDT
-TOP_CANDIDATES        = int(os.getenv("TOP_CANDIDATES", "5"))      # candidats analyses en detail
+MAX_DAILY_TRADES      = int(os.getenv("MAX_DAILY_TRADES", "20"))
+MAX_LOSS_STREAK       = int(os.getenv("MAX_LOSS_STREAK", "4"))
+MIN_CONFIDENCE        = float(os.getenv("MIN_CONFIDENCE", "0.60"))
+MAX_OPEN_POSITIONS    = int(os.getenv("MAX_OPEN_POSITIONS", "8"))
+ALL_SYMBOLS_MIN_VOL   = float(os.getenv("ALL_SYMBOLS_MIN_VOL", "50000"))
+TOP_CANDIDATES        = int(os.getenv("TOP_CANDIDATES", "6"))
+FUTURES_LEVERAGE      = int(os.getenv("FUTURES_LEVERAGE", "2"))     # levier futures (2x par defaut)
 SCAN_INTERVAL         = 60
 TV_CACHE_SECS         = 300
 CG_CACHE_SECS         = 600
@@ -111,16 +114,34 @@ else:
 # ─── CLIENTS ─────────────────────────────────────────────────
 if TESTNET:
     binance = Client(BINANCE_API_KEY, BINANCE_SECRET, testnet=True)
-    log.info("MODE TESTNET — aucun vrai argent en jeu")
+    log.info("MODE TESTNET spot — aucun vrai argent en jeu")
 else:
     binance = Client(BINANCE_API_KEY, BINANCE_SECRET)
     log.info("MODE LIVE — attention argent reel")
+
+# Client futures (testnet.binancefuture.com ou fapi.binance.com sur live)
+# Sur testnet: cert SSL auto-signe → verify=False obligatoire
+_ssl_params = {"verify": False} if TESTNET else {}
+futures_binance = Client(BINANCE_FUTURES_KEY, BINANCE_FUTURES_SEC,
+                         testnet=TESTNET, requests_params=_ssl_params)
+
+# Test si les futures sont accessibles
+_futures_enabled = False
+try:
+    futures_binance.futures_exchange_info()
+    _futures_enabled = True
+    log.info("Futures Binance: ACTIF (longs + shorts)")
+except Exception as _fe:
+    log.warning(f"Futures non disponibles ({_fe}) — LONG spot uniquement")
+    log.warning("Pour activer les shorts: ajouter BINANCE_FUTURES_KEY et BINANCE_FUTURES_SECRET dans .env")
+    log.warning("Cles disponibles sur testnet.binancefuture.com (testnet) ou Binance.com (live)")
 
 # Sync horloge avec Binance (evite -1021 timestamp error)
 try:
     server_ms = binance.get_server_time()["serverTime"]
     local_ms  = int(time.time() * 1000)
-    binance.timestamp_offset = server_ms - local_ms
+    binance.timestamp_offset          = server_ms - local_ms
+    futures_binance.timestamp_offset  = binance.timestamp_offset
     log.info(f"Timestamp offset Binance: {binance.timestamp_offset}ms")
 except Exception as e:
     log.warning(f"Impossible de syncer l'horloge Binance: {e}")
@@ -569,12 +590,13 @@ def get_market_context(symbol: str) -> dict:
     }
 
 # ─── DECISION IA MULTI-CRYPTO ─────────────────────────────────
-def ask_ai_multi(contexts: list) -> dict:
-    """Passe plusieurs paires candidates a Groq (Llama 3.3 70B)."""
+def ask_ai_multi(contexts: list, perf: dict = None) -> dict:
+    """Passe plusieurs paires candidates a Groq (Llama 3.3 70B) + historique."""
     balance   = contexts[0]["balance_usdt"]
     max_trade = round(balance * MAX_TRADE_PCT, 2)
     fg        = contexts[0]["fear_greed_value"]
     trending  = get_trending_coins()
+    perf      = perf or {"n": 0, "summary": "Aucun historique"}
 
     cands_text = ""
     for ctx in contexts:
@@ -599,54 +621,47 @@ def ask_ai_multi(contexts: list) -> dict:
   Positions ouvertes: {len(ctx['open_positions'])}{x_str}
 """
 
-    prompt = f"""Tu es un trader algorithmique expert. Tu geres un portefeuille spot sur Binance ({datetime.now().strftime('%H:%M UTC')}).
+    short_note = (
+        f"SELL (SHORT Futures x{FUTURES_LEVERAGE}) disponible"
+        if _futures_enabled else
+        "SHORT non disponible — BUY uniquement"
+    )
 
-CONTEXTE MARCHE:
+    prompt = f"""Tu es un trader algorithmique expert qui prend des decisions rapides et rentables ({datetime.now().strftime('%H:%M UTC')}).
+
+PORTEFEUILLE:
 - Capital: ${balance} | Fear&Greed: {fg}/100 ({contexts[0]['fear_greed_label']})
-- Trending CoinGecko: {', '.join(trending[:5]) if trending else 'N/A'}
-- Serie de pertes consecutives: {state['loss_streak']} (max autorise: {MAX_LOSS_STREAK})
+- Trending: {', '.join(trending[:5]) if trending else 'N/A'}
+- Positions ouvertes: {len(state['open_exits'])}/{MAX_OPEN_POSITIONS} | Pertes consecutives: {state['loss_streak']}
+
+HISTORIQUE ({perf['n']} trades): {perf['summary']}
 
 PAIRES CANDIDATES:
 {cands_text}
 
-CRITERES DE FILTRAGE STRICTS (elimine les setups faibles):
-1. ALIGNEMENT 4H OBLIGATOIRE: BUY seulement si biais_4h = BULLISH ou NEUTRE
-   → Si biais_4h = BEARISH: confidence requise > 0.82 minimum (contre-tendance)
-2. RSI 1h: BUY uniquement entre 32 et 67 (evite surachats/surventes extremes)
-3. VOLUME: vol_ratio >= 1.1x minimum pour confirmer le mouvement
-4. L/S RATIO: si "SURCHARGE LONGS" (>65% longs) → eviter nouveaux BUY (retournement probable)
-5. FUNDING: si "OVERLEV LONG" → signal baissier, reduire confiance de 0.10
-6. Confidence minimum: {MIN_CONFIDENCE} — en dessous → HOLD automatique
-7. R:R minimum: 1.8:1 (take_profit - entry doit etre >= 1.8x (entry - stop_loss))
-8. Stop-loss base sur ATR: SL = entry - (1.5 × ATR) arrondi au tick, max 2.5% de l'entry
-9. Take-profit = entry + (2.7 × ATR) minimum, max 4.5%
-10. Taille: utilise la taille ATR-optimale si disponible (ajustee a la volatilite)
+REGLES ESSENTIELLES:
+- Confidence min {MIN_CONFIDENCE} | R:R min 1.5 | SL max 3.5%
+- BUY: prefere RSI < 75, biais 4h non BEARISH
+- SELL/SHORT: prefere RSI > 25, biais 4h non BULLISH | {short_note}
+- SHORT: stop_loss SUPERIEUR a entry, take_profit INFERIEUR a entry
+- Apprends de l'historique: si beaucoup de pertes recentes, sois plus selectif; si bon win_rate, trade plus librement
+- HOLD seulement si vraiment rien de convaincant — prends les opportunites
 
-ACTION POSSIBLE: BUY uniquement (pas de SELL short sur spot)
+ACTIONS: BUY (long spot), SELL (short futures), HOLD
 
-Reponds UNIQUEMENT avec ce JSON valide (rien avant, rien apres):
-{{
-  "symbol": "SOLUSDT",
-  "action": "BUY",
-  "size_usdt": 120.00,
-  "entry_price": 185.50,
-  "stop_loss": 181.32,
-  "take_profit": 196.80,
-  "confidence": 0.71,
-  "reasoning": "4h BULLISH + RSI 1h=52 non survendu + vol 1.4x + EMA50 support + funding neutre"
-}}
-
-Si aucun setup ne respecte tous les criteres:
-{{"symbol": "NONE", "action": "HOLD", "size_usdt": null, "entry_price": null, "stop_loss": null, "take_profit": null, "confidence": 0.0, "reasoning": "raison precise"}}"""
+JSON uniquement:
+{{"symbol":"SOLUSDT","action":"BUY","size_usdt":100.00,"entry_price":185.50,"stop_loss":181.00,"take_profit":195.00,"confidence":0.72,"reasoning":"..."}}
+SHORT ex: {{"symbol":"BTCUSDT","action":"SELL","size_usdt":100.00,"entry_price":105000,"stop_loss":107500,"take_profit":100000,"confidence":0.68,"reasoning":"..."}}
+HOLD: {{"symbol":"NONE","action":"HOLD","size_usdt":null,"entry_price":null,"stop_loss":null,"take_profit":null,"confidence":0.0,"reasoning":"..."}}"""
 
     try:
         response = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
-                {"role": "system", "content": "Tu es un expert en trading algorithmique. Reponds TOUJOURS et UNIQUEMENT avec un objet JSON valide, sans aucun texte avant ou apres."},
+                {"role": "system", "content": "Expert trading algorithmique. Reponds UNIQUEMENT avec un objet JSON valide, sans texte avant ou apres."},
                 {"role": "user",   "content": prompt},
             ],
-            temperature=0.1,
+            temperature=0.15,
             max_tokens=300,
         )
         raw      = response.choices[0].message.content.strip().replace("```json", "").replace("```", "").strip()
@@ -661,83 +676,80 @@ Si aucun setup ne respecte tous les criteres:
         return {"symbol": "NONE", "action": "HOLD", "confidence": 0, "reasoning": str(e)}
 
 # ─── RISK GATE ────────────────────────────────────────────────
-def risk_gate(decision: dict, context: dict) -> tuple:
+def risk_gate(decision: dict, context: dict, min_conf: float = None) -> tuple:
     action = decision.get("action", "HOLD")
     if action == "HOLD":
         return True, "OK"
+    if action not in ("BUY", "SELL"):
+        return False, f"Action inconnue: {action}"
 
-    # Pause temporaire (perte journaliere ou serie de pertes)
-    if state["paused"]:
-        if time.time() < state.get("paused_until", 0):
-            remaining = int((state["paused_until"] - time.time()) / 60)
-            return False, f"Bot en pause ({remaining} min restantes)"
-        else:
-            state["paused"] = False
+    # SELL/SHORT requiert futures actives
+    if action == "SELL" and not _futures_enabled:
+        return False, "SHORT refuse: futures non actives (configurer BINANCE_FUTURES_KEY)"
+
+    # Pause
+    if state["paused"] and time.time() < state.get("paused_until", 0):
+        remaining = int((state["paused_until"] - time.time()) / 60)
+        return False, f"Bot en pause ({remaining} min restantes)"
+    elif state["paused"]:
+        state["paused"] = False
 
     # Max trades quotidiens
     if len(state["trades_today"]) >= MAX_DAILY_TRADES:
         return False, f"Max trades atteint ({MAX_DAILY_TRADES}/jour)"
 
-    # Serie de pertes consecutives
+    # Serie de pertes
     if state["loss_streak"] >= MAX_LOSS_STREAK:
-        return False, f"Serie de pertes ({state['loss_streak']}x) — pause forcee"
+        return False, f"Serie de pertes ({state['loss_streak']}x)"
 
-    # Confidence minimum
-    conf = decision.get("confidence", 0)
-    if conf < MIN_CONFIDENCE:
-        return False, f"Confidence trop faible ({conf:.2f} < {MIN_CONFIDENCE})"
+    # Confidence (adaptative si fournie)
+    eff_conf = min_conf if min_conf is not None else MIN_CONFIDENCE
+    conf     = decision.get("confidence", 0)
+    if conf < eff_conf:
+        return False, f"Confidence {conf:.2f} < {eff_conf:.2f}"
 
     # Stop-loss obligatoire
     if not decision.get("stop_loss"):
         return False, "Stop-loss manquant"
 
-    entry  = decision.get("entry_price", 0)
-    sl     = decision.get("stop_loss", 0)
-    tp     = decision.get("take_profit", 0)
+    entry = decision.get("entry_price", 0)
+    sl    = decision.get("stop_loss", 0)
+    tp    = decision.get("take_profit", 0)
 
-    # Taille de position
+    # Taille
     size     = decision.get("size_usdt") or 0
     max_size = context.get("max_size_usdt") or (context["balance_usdt"] * MAX_TRADE_PCT)
-    if size > max_size * 1.05:  # tolérance 5%
+    if size > max_size * 1.05:
         decision["size_usdt"] = round(max_size, 2)
-        log.info(f"Taille réduite: ${size} → ${decision['size_usdt']:.2f}")
     if decision["size_usdt"] < 10:
-        return False, f"Taille trop petite (${decision['size_usdt']:.2f} < $10)"
+        return False, f"Taille trop petite (${decision['size_usdt']:.2f})"
     if decision["size_usdt"] > context["balance_usdt"]:
-        return False, f"Balance insuffisante (${context['balance_usdt']:.2f} dispo)"
+        return False, f"Balance insuffisante (${context['balance_usdt']:.2f})"
 
-    # RSI 1h: eviter extremes
+    # RSI extremes (assoupli : 80 au lieu de 72)
     rsi = context.get("rsi_14", 50)
-    if action == "BUY" and rsi > 72:
-        return False, f"RSI 1h surachete ({rsi} > 72)"
+    if action == "BUY"  and rsi > 80:
+        return False, f"RSI trop surachete ({rsi} > 80)"
+    if action == "SELL" and rsi < 20:
+        return False, f"RSI trop survendu ({rsi} < 20) pour shorter"
 
-    # Volume minimum
+    # Volume minimal (assoupli : 0.3x)
     vol_ratio = context.get("volume_ratio", 1.0)
-    if vol_ratio < 0.5:
-        return False, f"Volume insuffisant ({vol_ratio}x < 0.5x)"
+    if vol_ratio < 0.3:
+        return False, f"Volume trop faible ({vol_ratio}x < 0.3x)"
 
-    # Biais 4h : contre-tendance requiert conf > 0.82
-    bias_4h = context.get("bias_4h", "NEUTRE")
-    if action == "BUY" and bias_4h == "BEARISH" and conf <= 0.82:
-        return False, f"Contre-tendance 4h BEARISH (conf {conf:.2f} <= 0.82)"
-
-    # Surcharge longs (risque de liquidation cascade)
-    ls_label = context.get("ls_label", "")
-    if action == "BUY" and ls_label == "SURCHARGE LONGS":
-        return False, "Marche surcharge en longs — BUY risque"
-
-    # R:R minimum 1.8
+    # R:R minimum 1.5 (assoupli depuis 1.8)
     if entry and sl and tp:
         risk   = abs(entry - sl)
         reward = abs(tp - entry)
-        if risk > 0 and (reward / risk) < 1.8:
-            return False, f"R:R insuffisant ({reward/risk:.2f} < 1.8)"
+        if risk > 0 and (reward / risk) < 1.5:
+            return False, f"R:R {reward/risk:.2f} < 1.5"
 
-    # SL max 2.5% sous l'entry
+    # SL max 3.5% (assoupli depuis 2.5%)
     if entry and sl:
         sl_pct = abs(entry - sl) / entry * 100
-        if sl_pct > 2.5:
-            return False, f"SL trop loin ({sl_pct:.2f}% > 2.5%)"
+        if sl_pct > 3.5:
+            return False, f"SL trop loin ({sl_pct:.2f}% > 3.5%)"
 
     return True, "OK"
 
@@ -774,11 +786,59 @@ def place_exit_orders(symbol: str, qty: float, stop_loss: float,
         return None
 
 
+def _close_position(sym: str, info: dict, fill_px: float, is_short: bool = False):
+    """Traite la cloture d'une position — PnL, streak, log, trades.json."""
+    entry_px = info.get("entry_price", fill_px)
+    sl_px    = info.get("sl", 0)
+    # Pour un SHORT, le SL est au-dessus de l'entree
+    if is_short:
+        pnl = (entry_px - fill_px) / entry_px * 100 if entry_px else 0
+        is_sl = fill_px >= sl_px * 0.998
+    else:
+        pnl = (fill_px - entry_px) / entry_px * 100 if entry_px else 0
+        is_sl = fill_px <= sl_px * 1.002
+
+    outcome = "LOSS" if is_sl else "WIN"
+    if is_sl:
+        state["loss_streak"] = state.get("loss_streak", 0) + 1
+        log.warning(f"SL {sym} @ ${fill_px:.4g} | PnL {pnl:+.2f}% | streak {state['loss_streak']}")
+        send_telegram(f"{'SHORT' if is_short else 'LONG'} SL *{sym}* `{pnl:+.2f}%` streak:{state['loss_streak']}")
+    else:
+        state["loss_streak"] = 0
+        log.info(f"TP {sym} @ ${fill_px:.4g} | PnL {pnl:+.2f}%")
+        send_telegram(f"{'SHORT' if is_short else 'LONG'} TP *{sym}* `{pnl:+.2f}%` WIN")
+
+    update_trade_outcome(sym, info.get("oco_id"), pnl / 100, outcome)
+
+
 def sync_open_positions():
-    """Retire de open_exits les OCO clos (TP ou SL declenche) et met a jour loss_streak."""
+    """Retire de open_exits les OCO/futures clos et met a jour loss_streak + trades.json."""
     to_remove = []
     for sym, info in list(state["open_exits"].items()):
-        oco_id = info.get("oco_id")
+        oco_id   = info.get("oco_id")
+        is_short = info.get("is_short", False)
+
+        # ── Futures SHORT ──
+        if is_short and _futures_enabled:
+            try:
+                pos = futures_binance.futures_position_information(symbol=sym)
+                amt = float(pos[0].get("positionAmt", 0)) if pos else 0
+                if abs(amt) < 1e-9:  # position fermee
+                    # Lire le dernier trade futures pour le PnL
+                    try:
+                        trades_f = futures_binance.futures_account_trades(symbol=sym, limit=5)
+                        if trades_f:
+                            last = trades_f[-1]
+                            fill_px = float(last.get("price", info.get("entry_price", 0)))
+                            _close_position(sym, info, fill_px, is_short=True)
+                    except Exception:
+                        pass
+                    to_remove.append(sym)
+            except Exception as e:
+                log.warning(f"sync futures {sym}: {e}")
+            continue
+
+        # ── Spot LONG (OCO) ──
         if not oco_id:
             continue
         try:
@@ -786,33 +846,20 @@ def sync_open_positions():
             status = oco.get("listOrderStatus", "")
             if status not in ("ALL_DONE", "RESPONSE"):
                 continue
-            # OCO fini — chercher l'ordre FILLED pour savoir SL ou TP
             for ord_ref in oco.get("orders", []):
                 try:
-                    detail    = binance.get_order(symbol=sym, orderId=ord_ref["orderId"])
-                    ord_type  = detail.get("type", "")
-                    ord_st    = detail.get("status", "")
-                    if ord_st != "FILLED":
+                    detail = binance.get_order(symbol=sym, orderId=ord_ref["orderId"])
+                    if detail.get("status") != "FILLED":
                         continue
-                    fill_px   = float(detail.get("price", 0) or detail.get("cummulativeQuoteQty", 0))
-                    entry_px  = info.get("entry_price", fill_px)
-                    sl_px     = info.get("sl", 0)
-                    if fill_px and fill_px <= sl_px * 1.002:  # ±0.2% = SL
-                        state["loss_streak"] = state.get("loss_streak", 0) + 1
-                        pnl = (fill_px - entry_px) / entry_px * 100 if entry_px else 0
-                        log.warning(f"SL {sym} @ ${fill_px:.4g} | PnL {pnl:+.2f}% | streak {state['loss_streak']}")
-                        send_telegram(f"SL *{sym}* @ `${fill_px:.4g}` | PnL `{pnl:+.2f}%`")
-                    else:
-                        state["loss_streak"] = 0
-                        pnl = (fill_px - entry_px) / entry_px * 100 if entry_px else 0
-                        log.info(f"TP {sym} @ ${fill_px:.4g} | PnL {pnl:+.2f}%")
-                        send_telegram(f"TP *{sym}* @ `${fill_px:.4g}` | PnL `{pnl:+.2f}%`")
+                    fill_px = float(detail.get("price") or detail.get("avgPrice") or 0)
+                    if fill_px:
+                        _close_position(sym, info, fill_px, is_short=False)
                     break
                 except Exception:
                     pass
             to_remove.append(sym)
         except Exception as e:
-            log.warning(f"sync OCO check {sym}: {e}")
+            log.warning(f"sync OCO {sym}: {e}")
 
     for sym in to_remove:
         del state["open_exits"][sym]
@@ -820,9 +867,103 @@ def sync_open_positions():
         log.info(f"Positions fermees: {', '.join(to_remove)}")
 
 
+# ─── SHORT FUTURES ────────────────────────────────────────────
+def execute_short(decision: dict, context: dict):
+    """Ouvre un SHORT via Binance Futures USD-M avec levier et SL/TP."""
+    if not _futures_enabled:
+        log.warning("SHORT ignore: futures non actives (ajouter BINANCE_FUTURES_KEY dans .env)")
+        return
+
+    symbol = decision.get("symbol") or context["symbol"]
+    price  = context["price"]
+    size   = decision["size_usdt"]
+    sl     = decision.get("stop_loss")   # > entry pour un short
+    tp     = decision.get("take_profit") # < entry pour un short
+
+    step = get_step_size(symbol)
+    qty  = round_qty((size * FUTURES_LEVERAGE) / price, step)
+
+    try:
+        # Levier
+        try:
+            futures_binance.futures_change_leverage(symbol=symbol, leverage=FUTURES_LEVERAGE)
+        except Exception:
+            pass
+
+        # Ordre short (SELL sur futures = ouvrir une position short)
+        order = futures_binance.futures_create_order(
+            symbol=symbol, side="SELL", type="MARKET", quantity=qty
+        )
+        fill_price = float(order.get("avgPrice") or price)
+        log.info(f"SHORT EXECUTE: {qty} {symbol} @ ~${fill_price:,.6g} x{FUTURES_LEVERAGE} (#{order.get('orderId')})")
+
+        # Stop-Loss (ABOVE entry for short)
+        if sl:
+            try:
+                futures_binance.futures_create_order(
+                    symbol=symbol, side="BUY", type="STOP_MARKET",
+                    stopPrice=str(round_price(sl, get_tick_size(symbol))),
+                    closePosition=True, timeInForce="GTE_GTC",
+                )
+            except Exception as e:
+                log.warning(f"Futures SL order error {symbol}: {e}")
+
+        # Take-Profit (BELOW entry for short)
+        if tp:
+            try:
+                futures_binance.futures_create_order(
+                    symbol=symbol, side="BUY", type="TAKE_PROFIT_MARKET",
+                    stopPrice=str(round_price(tp, get_tick_size(symbol))),
+                    closePosition=True, timeInForce="GTE_GTC",
+                )
+            except Exception as e:
+                log.warning(f"Futures TP order error {symbol}: {e}")
+
+        trade_log = {
+            "timestamp":   datetime.now().isoformat(),
+            "symbol":      symbol,
+            "action":      "SELL",
+            "direction":   "SHORT",
+            "qty":         qty,
+            "leverage":    FUTURES_LEVERAGE,
+            "entry_price": fill_price,
+            "stop_loss":   sl,
+            "take_profit": tp,
+            "size_usdt":   size,
+            "reasoning":   decision.get("reasoning"),
+            "confidence":  decision.get("confidence"),
+            "order_id":    order.get("orderId"),
+        }
+        state["trades_today"].append(trade_log)
+        save_trade_log(trade_log)
+        state["open_exits"][symbol] = {
+            "oco_id":      None,
+            "sl":          sl,
+            "tp":          tp,
+            "qty":         qty,
+            "entry_price": fill_price,
+            "is_short":    True,
+        }
+
+        sl_pct = abs(sl - fill_price) / fill_price * 100 if sl else 0
+        tp_pct = abs(fill_price - tp) / fill_price * 100 if tp else 0
+        send_telegram(
+            f"SHORT *{symbol}* x{FUTURES_LEVERAGE}\n"
+            f"Entry: `${fill_price:,.6g}` | Taille: `${size}` USDT\n"
+            f"SL: `+{sl_pct:.1f}%` (${sl:,.6g}) | TP: `-{tp_pct:.1f}%` (${tp:,.6g})\n"
+            f"Conf: `{decision['confidence']}` | _{decision.get('reasoning','-')}_"
+        )
+    except BinanceAPIException as e:
+        log.error(f"Futures error execute_short: {e}")
+        send_telegram(f"Erreur SHORT {symbol}: {e.message}")
+
+
 # ─── EXECUTION ────────────────────────────────────────────────
 def execute_trade(decision: dict, context: dict):
     action = decision["action"]
+    if action == "SELL":
+        execute_short(decision, context)
+        return
     if action != "BUY":
         return
 
@@ -882,11 +1023,102 @@ def save_trade_log(trade: dict):
         if log_file.exists():
             with open(log_file) as f:
                 logs = json.load(f)
-        logs.append(trade)
+        # Update existant si meme order_id, sinon append
+        oid = trade.get("order_id")
+        updated = False
+        if oid:
+            for i, t in enumerate(logs):
+                if t.get("order_id") == oid:
+                    logs[i] = {**t, **trade}
+                    updated = True
+                    break
+        if not updated:
+            logs.append(trade)
         with open(log_file, "w") as f:
             json.dump(logs, f, indent=2)
     except Exception as e:
         log.error(f"Erreur save trade log: {e}")
+
+
+def update_trade_outcome(symbol: str, order_id, pnl_pct: float, outcome: str):
+    """Ecrit le resultat (WIN/LOSS + PnL%) dans trades.json pour apprentissage."""
+    try:
+        log_file = SCRIPT_DIR / "trades.json"
+        if not log_file.exists():
+            return
+        with open(log_file) as f:
+            logs = json.load(f)
+        for t in reversed(logs):
+            if t.get("symbol") == symbol and t.get("oco_id") is not None:
+                t["pnl_pct"]  = round(pnl_pct, 4)
+                t["outcome"]  = outcome
+                t["closed_at"] = datetime.now().isoformat()
+                break
+        with open(log_file, "w") as f:
+            json.dump(logs, f, indent=2)
+    except Exception as e:
+        log.warning(f"update_trade_outcome error: {e}")
+
+
+def get_perf_stats(n: int = 20) -> dict:
+    """Stats des n derniers trades clotures depuis trades.json (apprentissage)."""
+    try:
+        log_file = SCRIPT_DIR / "trades.json"
+        if not log_file.exists():
+            return {"n": 0, "win_rate": 0.5, "avg_pnl": 0.0, "summary": "Aucun historique"}
+        with open(log_file) as f:
+            trades = json.load(f)
+        closed = [t for t in trades if t.get("outcome") in ("WIN", "LOSS")][-n:]
+        if not closed:
+            return {"n": 0, "win_rate": 0.5, "avg_pnl": 0.0, "summary": "Aucun trade cloture"}
+        wins     = [t for t in closed if t.get("outcome") == "WIN"]
+        losses   = [t for t in closed if t.get("outcome") == "LOSS"]
+        win_rate = len(wins) / len(closed)
+        avg_pnl  = sum(t.get("pnl_pct", 0) for t in closed) / len(closed)
+        # Meilleurs/pires symboles
+        sym_pnl = {}
+        for t in closed:
+            s = t.get("symbol", "?")
+            sym_pnl.setdefault(s, []).append(t.get("pnl_pct", 0))
+        sym_avg = {s: sum(v) / len(v) for s, v in sym_pnl.items()}
+        best_sym  = max(sym_avg, key=sym_avg.get, default="?")
+        worst_sym = min(sym_avg, key=sym_avg.get, default="?")
+        # Resume des 5 derniers
+        recent_str = " | ".join(
+            f"{'WIN' if t.get('outcome')=='WIN' else 'LOSS'} {t.get('action','?')} "
+            f"{t.get('symbol','?')} {t.get('pnl_pct',0):+.1f}%"
+            for t in closed[-5:]
+        )
+        return {
+            "n":         len(closed),
+            "win_rate":  win_rate,
+            "avg_pnl":   avg_pnl,
+            "best_sym":  best_sym,
+            "worst_sym": worst_sym,
+            "summary":   (f"{len(wins)}W/{len(losses)}L | "
+                          f"win_rate {win_rate*100:.0f}% | "
+                          f"avg_pnl {avg_pnl*100:+.2f}% | "
+                          f"derniers: {recent_str}"),
+        }
+    except Exception as e:
+        log.warning(f"get_perf_stats error: {e}")
+        return {"n": 0, "win_rate": 0.5, "avg_pnl": 0.0, "summary": "Erreur lecture historique"}
+
+
+def adaptive_min_confidence(perf: dict) -> float:
+    """Ajuste MIN_CONFIDENCE selon les performances recentes (apprentissage)."""
+    if perf["n"] < 6:
+        return MIN_CONFIDENCE
+    wr = perf["win_rate"]
+    if wr >= 0.65:
+        conf = max(0.55, MIN_CONFIDENCE - 0.05)
+        log.info(f"Perf bonne (WR {wr*100:.0f}%) → confiance abaissee a {conf:.2f}")
+    elif wr <= 0.40:
+        conf = min(0.80, MIN_CONFIDENCE + 0.08)
+        log.info(f"Perf faible (WR {wr*100:.0f}%) → confiance remontee a {conf:.2f}")
+    else:
+        conf = MIN_CONFIDENCE
+    return conf
 
 # ─── GESTION QUOTIDIENNE ─────────────────────────────────────
 def check_daily_reset():
@@ -1022,18 +1254,22 @@ def run_bot():
                 time.sleep(SCAN_INTERVAL)
                 continue
 
-            # Décision IA
-            decision = ask_ai_multi(contexts)
+            # Stats + confiance adaptive
+            perf     = get_perf_stats()
+            min_conf = adaptive_min_confidence(perf)
+
+            # Décision IA (avec historique)
+            decision = ask_ai_multi(contexts, perf=perf)
             symbol   = decision.get("symbol", "NONE")
 
             if symbol == "NONE" or decision.get("action") == "HOLD":
                 log.info(f"IA HOLD — {decision.get('reasoning', '')}")
             else:
                 ctx = next((c for c in contexts if c["symbol"] == symbol), contexts[0])
-                approved, reason = risk_gate(decision, ctx)
+                approved, reason = risk_gate(decision, ctx, min_conf=min_conf)
                 if not approved:
                     log.info(f"Risk Gate refus: {reason}")
-                    if decision.get("confidence", 0) >= MIN_CONFIDENCE:
+                    if decision.get("confidence", 0) >= min_conf:
                         send_telegram(f"*Trade refuse*\n{symbol}: {reason}")
                 else:
                     execute_trade(decision, ctx)
