@@ -215,6 +215,10 @@
         <span class="status-val blue" id="sTrades">—</span>
       </div>
       <div class="status-item">
+        <span class="status-key">POSITIONS OUVERTES</span>
+        <span class="status-val" id="sOpenPos" style="color:var(--yellow);font-size:11px">—</span>
+      </div>
+      <div class="status-item">
         <span class="status-key">SCAN ACTIF</span>
         <span class="status-val" id="sScan" style="color:var(--purple);font-size:11px">—</span>
       </div>
@@ -392,6 +396,16 @@ async function fetchStatus() {
     document.getElementById('statCurrent').textContent = data.current_scan || '—';
     document.getElementById('sScan').textContent       = data.current_scan || '—';
 
+    const openSyms = data.open_symbols || [];
+    const openEl   = document.getElementById('sOpenPos');
+    if (openSyms.length) {
+      openEl.textContent  = openSyms.map(s => s.replace('USDT','')).join(' · ');
+      openEl.style.color  = 'var(--yellow)';
+    } else {
+      openEl.textContent = '—';
+      openEl.style.color = 'var(--muted)';
+    }
+
     const now = new Date().toLocaleTimeString('fr-FR');
     document.getElementById('sUpdate').textContent    = now;
     document.getElementById('lastUpdate').textContent = `Mis à jour : ${now}`;
@@ -424,9 +438,11 @@ async function fetchTrades() {
 
 function buildEquityData(trades) {
   if (!trades.length) { equityData=[]; drawChart([], startBalance); return; }
-  let balance = startBalance || 10000;
+  let balance = startBalance || 1000;
   const points = [{ balance, trade: null }];
   trades.forEach(t => {
+    // Applique le PnL reel si disponible (trades clotures)
+    if (t.pnl_pct != null) balance = balance * (1 + t.pnl_pct);
     points.push({ balance, trade: t.action, time: t.timestamp ? new Date(t.timestamp).toLocaleTimeString('fr-FR') : '?' });
   });
   equityData = points;
@@ -474,16 +490,23 @@ function renderTrades(trades) {
 
 // ── RENDER WIN RATE ──────────────────────────────────────────
 function renderWinRate(trades) {
-  const total   = trades.length;
-  const avgConf = total ? (trades.reduce((s,t) => s+(t.confidence||0),0)/total*100).toFixed(0) : 0;
-  document.getElementById('wrTotal').textContent  = total;
-  document.getElementById('wrWins').textContent   = '—';
-  document.getElementById('wrLosses').textContent = '—';
-  document.getElementById('wrPct').textContent    = `${avgConf}% conf. moy.`;
-  document.getElementById('wrBar').style.width    = `${avgConf}%`;
-  if (total) {
+  const closed  = trades.filter(t => t.outcome === 'WIN' || t.outcome === 'LOSS');
+  const wins    = closed.filter(t => t.outcome === 'WIN').length;
+  const losses  = closed.filter(t => t.outcome === 'LOSS').length;
+  const wr      = closed.length > 0 ? Math.round(wins / closed.length * 100) : 0;
+  const avgConf = trades.length ? Math.round(trades.reduce((s,t) => s+(t.confidence||0),0)/trades.length*100) : 0;
+  const avgPnl  = closed.length ? (closed.reduce((s,t) => s+(t.pnl_pct||0),0)/closed.length*100).toFixed(2) : null;
+
+  document.getElementById('wrTotal').textContent  = closed.length || trades.length;
+  document.getElementById('wrWins').textContent   = closed.length ? wins : '—';
+  document.getElementById('wrLosses').textContent = closed.length ? losses : '—';
+  document.getElementById('wrPct').textContent    = closed.length
+    ? `${wr}% win rate${avgPnl !== null ? ' · ' + (avgPnl > 0 ? '+' : '') + avgPnl + '% pnl moy' : ''}`
+    : `${avgConf}% conf. moy.`;
+  document.getElementById('wrBar').style.width    = `${closed.length ? wr : avgConf}%`;
+  if (trades.length) {
     const best = trades.reduce((mx,t) => (t.confidence||0)>(mx.confidence||0)?t:mx, trades[0]);
-    document.getElementById('statPairsSub').textContent = `best: ${best.symbol||'?'}`;
+    document.getElementById('statPairsSub').textContent = `best conf: ${best.symbol||'?'}`;
   }
 }
 

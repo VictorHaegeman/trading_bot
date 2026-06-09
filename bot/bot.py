@@ -34,6 +34,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import threading
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 # ─── HTTP SESSION AVEC RETRY/POOLING ─────────────────────────
@@ -177,12 +178,17 @@ def send_telegram(message: str):
         log.error(f"Telegram error: {e}")
 
 # ─── DONNEES BINANCE ─────────────────────────────────────────
+_symbols_cache: dict = {"value": [], "ts": 0.0}
+
 def get_all_symbols() -> list:
-    """Toutes les paires USDT de Binance avec volume suffisant, sans tokens levier."""
+    """Toutes les paires USDT de Binance avec volume suffisant, sans tokens levier. Cache 10min."""
+    now = time.time()
+    if now - _symbols_cache["ts"] < 600 and _symbols_cache["value"]:
+        return _symbols_cache["value"]
     try:
-        excluded = ["DOWN", "UP", "BEAR", "BULL", "3L", "3S", "2L", "2S", "BUSD"]
-        tickers = binance.get_ticker()
-        pairs = [
+        excluded = ["DOWN", "UP", "BEAR", "BULL", "3L", "3S", "2L", "2S", "BUSD", "LP"]
+        tickers  = binance.get_ticker()
+        pairs    = [
             t for t in tickers
             if t["symbol"].endswith("USDT")
             and not any(x in t["symbol"] for x in excluded)
@@ -190,11 +196,13 @@ def get_all_symbols() -> list:
         ]
         pairs.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
         result = [t["symbol"] for t in pairs]
+        _symbols_cache["value"] = result
+        _symbols_cache["ts"]    = now
         log.info(f"Univers: {len(result)} paires USDT (vol>{'%.0fk' % (ALL_SYMBOLS_MIN_VOL/1000)}/24h)")
         return result
     except Exception as e:
         log.warning(f"get_all_symbols error: {e}")
-        return ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]
+        return _symbols_cache["value"] or ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]
 
 def get_price(symbol: str) -> float:
     return float(binance.get_symbol_ticker(symbol=symbol)["price"])
@@ -237,8 +245,9 @@ def get_fear_greed() -> dict:
         return _fg_cache["value"] or {"value": 50, "label": "Neutral"}
 
 def get_balance() -> float:
-    now = time.time()
-    if now - _bal_cache["ts"] < 30:
+    now     = time.time()
+    max_age = 5 if len(state.get("open_exits", {})) > 0 else 30
+    if now - _bal_cache["ts"] < max_age:
         return _bal_cache["value"]
     try:
         account = binance.get_account()
@@ -259,16 +268,26 @@ def get_open_positions(symbol: str = None) -> list:
     except:
         return []
 
-def get_step_size(symbol: str) -> float:
-    """Retourne le stepSize pour la precision de quantite."""
+_precision_cache: dict = {}  # {symbol: {step, tick}}
+
+def _fetch_precision(symbol: str) -> dict:
+    if symbol in _precision_cache:
+        return _precision_cache[symbol]
+    step, tick = 0.001, 0.01
     try:
         info = binance.get_symbol_info(symbol)
-        for f in info["filters"]:
+        for f in info.get("filters", []):
             if f["filterType"] == "LOT_SIZE":
-                return float(f["stepSize"])
-    except:
+                step = float(f["stepSize"])
+            elif f["filterType"] == "PRICE_FILTER":
+                tick = float(f["tickSize"])
+    except Exception:
         pass
-    return 0.001
+    _precision_cache[symbol] = {"step": step, "tick": tick}
+    return _precision_cache[symbol]
+
+def get_step_size(symbol: str) -> float:
+    return _fetch_precision(symbol)["step"]
 
 def round_qty(qty: float, step: float) -> float:
     if step <= 0:
@@ -277,15 +296,7 @@ def round_qty(qty: float, step: float) -> float:
     return round(round(qty / step) * step, precision)
 
 def get_tick_size(symbol: str) -> float:
-    """Tick size pour la precision des prix (OCO orders)."""
-    try:
-        info = binance.get_symbol_info(symbol)
-        for f in info["filters"]:
-            if f["filterType"] == "PRICE_FILTER":
-                return float(f["tickSize"])
-    except:
-        pass
-    return 0.01
+    return _fetch_precision(symbol)["tick"]
 
 def round_price(price: float, tick: float) -> float:
     if tick <= 0:
@@ -535,6 +546,23 @@ def get_trending_coins() -> list:
     except:
         return state.get("trending", [])
 
+# ─── ORDERBOOK IMBALANCE ─────────────────────────────────────
+def get_orderbook_imbalance(symbol: str, levels: int = 20) -> dict:
+    """Ratio bids vs asks (pression achat immédiate)."""
+    try:
+        ob   = binance.get_order_book(symbol=symbol, limit=levels)
+        bids = sum(float(b[1]) for b in ob["bids"][:levels])
+        asks = sum(float(a[1]) for a in ob["asks"][:levels])
+        total = bids + asks
+        imb   = (bids - asks) / total if total > 0 else 0
+        label = ("FORT BUY" if imb > 0.20 else "BUY" if imb > 0.07
+                 else "FORT SELL" if imb < -0.20 else "SELL" if imb < -0.07
+                 else "NEUTRE")
+        return {"imbalance": round(imb, 3), "label": label}
+    except Exception:
+        return {"imbalance": 0.0, "label": "N/A"}
+
+
 # ─── CONTEXTE MARCHE ─────────────────────────────────────────
 def get_market_context(symbol: str) -> dict:
     """Agrege toutes les donnees de marche pour une paire."""
@@ -555,13 +583,12 @@ def get_market_context(symbol: str) -> dict:
     futures = get_futures_context(symbol)
     ls      = get_ls_ratio(symbol)
     htf     = get_htf_bias(symbol)
+    ob      = get_orderbook_imbalance(symbol)
 
-    # Taille max dynamique basee sur ATR (risquer 1.5% du capital max)
-    # SL typique = 1.5x ATR ; size = risk_amount / (1.5*ATR/price)
-    risk_amount = balance * 0.015
-    atr_sl_dist = 1.5 * atr / price if price > 0 else 0.02
+    risk_amount    = balance * 0.015
+    atr_sl_dist    = 1.5 * atr / price if price > 0 else 0.02
     atr_based_size = round(risk_amount / atr_sl_dist, 2) if atr_sl_dist > 0 else balance * MAX_TRADE_PCT
-    max_size = min(balance * MAX_TRADE_PCT, atr_based_size)
+    max_size       = min(balance * MAX_TRADE_PCT, atr_based_size)
 
     return {
         "symbol":           symbol,
@@ -587,6 +614,8 @@ def get_market_context(symbol: str) -> dict:
         "ls_label":         ls["ls_label"],
         "bias_4h":          htf["bias_4h"],
         "rsi_4h":           htf["rsi_4h"],
+        "ob_imbalance":     ob["imbalance"],
+        "ob_label":         ob["label"],
     }
 
 # ─── DECISION IA MULTI-CRYPTO ─────────────────────────────────
@@ -618,6 +647,7 @@ def ask_ai_multi(contexts: list, perf: dict = None) -> dict:
   Vol ratio: {ctx['volume_ratio']}x | ATR: {atr_p:.2f}% du prix | Taille ATR-optimale: ${max_sz}
   TradingView: {tv.get('label','N/A')} (rec {rec:+.2f}) | MACD: {tv.get('macd',0) or 0:.4g} vs {tv.get('macd_signal',0) or 0:.4g}
   Funding: {f"{fr:+.4f}%" if fr is not None else "N/A"} ({ctx.get('funding_label','N/A')}) | L/S: {f"{lp:.0f}% longs" if lp else "N/A"} ({ctx.get('ls_label','N/A')})
+  Orderbook: imbalance={ctx.get('ob_imbalance',0):+.3f} ({ctx.get('ob_label','N/A')})
   Positions ouvertes: {len(ctx['open_positions'])}{x_str}
 """
 
@@ -716,15 +746,19 @@ def risk_gate(decision: dict, context: dict, min_conf: float = None) -> tuple:
     sl    = decision.get("stop_loss", 0)
     tp    = decision.get("take_profit", 0)
 
-    # Taille
+    # Taille adaptative — reduit si serie de pertes
+    streak   = state.get("loss_streak", 0)
+    streak_factor = 0.5 if streak >= 3 else 0.7 if streak >= 2 else 1.0
     size     = decision.get("size_usdt") or 0
-    max_size = context.get("max_size_usdt") or (context["balance_usdt"] * MAX_TRADE_PCT)
+    max_size = (context.get("max_size_usdt") or (context["balance_usdt"] * MAX_TRADE_PCT)) * streak_factor
     if size > max_size * 1.05:
         decision["size_usdt"] = round(max_size, 2)
     if decision["size_usdt"] < 10:
         return False, f"Taille trop petite (${decision['size_usdt']:.2f})"
     if decision["size_usdt"] > context["balance_usdt"]:
         return False, f"Balance insuffisante (${context['balance_usdt']:.2f})"
+    if streak_factor < 1.0:
+        log.info(f"Taille reduite ×{streak_factor} (streak {streak} pertes)")
 
     # RSI extremes (assoupli : 80 au lieu de 72)
     rsi = context.get("rsi_14", 50)
@@ -1210,21 +1244,28 @@ def run_bot():
                 time.sleep(SCAN_INTERVAL)
                 continue
 
-            # Max positions ouvertes atteint
+            # Max positions — polling rapide toutes les 5s (pas d'attente 60s)
             n_open = len(state["open_exits"])
             if n_open >= MAX_OPEN_POSITIONS:
-                log.info(f"Max positions ({n_open}/{MAX_OPEN_POSITIONS}) — en attente de fermeture")
-                time.sleep(SCAN_INTERVAL)
+                log.info(f"Max positions ({n_open}/{MAX_OPEN_POSITIONS}) — poll toutes les 5s")
+                for _ in range(12):   # max 60s total
+                    time.sleep(5)
+                    sync_open_positions()
+                    if len(state["open_exits"]) < MAX_OPEN_POSITIONS:
+                        break
                 continue
 
-            # Univers de paires + signaux TV (avec cache 5min)
+            # Univers de paires + signaux TV (cache adaptatif)
             symbols = get_all_symbols()
             state["scanning_symbols"] = symbols
 
             now_ts = time.time()
-            if now_ts - state["last_tv_update"] > TV_CACHE_SECS:
+            # Cache TV plus court si marche volatile (ATR eleve)
+            atr_pct = state.get("last_atr_pct", 1.0)
+            tv_ttl  = 120 if atr_pct > 2.5 else TV_CACHE_SECS
+            if now_ts - state["last_tv_update"] > tv_ttl:
                 nb = max(1, len(symbols) // 100 + 1)
-                log.info(f"Refresh TradingView ({len(symbols)} paires en {nb} batches)...")
+                log.info(f"Refresh TradingView ({len(symbols)} paires en {nb} batches, ttl={tv_ttl}s)...")
                 tv = get_tv_signals(symbols)
                 state["tv_signals"]     = tv
                 state["last_tv_update"] = now_ts
@@ -1250,17 +1291,28 @@ def run_bot():
             log.info(f"Top candidats: {', '.join(f'{s}({r:+.2f})' for s, r in top_cands)}")
             state["current_scan"] = top_cands[0][0]
 
-            # Contexte detaille pour chaque candidat
+            # Contexte detaille — fetch en parallele (3 threads)
+            def _fetch_ctx(sym_rec):
+                sym, rec = sym_rec
+                ctx                      = get_market_context(sym)
+                ctx["tv_recommendation"] = rec
+                ctx["tv_signals"]        = tv.get(sym, {})
+                ctx["x_sentiment"]       = get_x_sentiment(sym)
+                return ctx
+
             contexts = []
-            for sym, rec in top_cands:
-                try:
-                    ctx                      = get_market_context(sym)
-                    ctx["tv_recommendation"] = rec
-                    ctx["tv_signals"]        = tv.get(sym, {})
-                    ctx["x_sentiment"]       = get_x_sentiment(sym)
-                    contexts.append(ctx)
-                except Exception as e:
-                    log.warning(f"Contexte {sym} erreur: {e}")
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                futs = {pool.submit(_fetch_ctx, sr): sr[0] for sr in top_cands}
+                for fut in as_completed(futs):
+                    sym = futs[fut]
+                    try:
+                        contexts.append(fut.result())
+                    except Exception as e:
+                        log.warning(f"Contexte {sym} erreur: {e}")
+
+            # Mettre a jour l'ATR moyen pour le cache TV adaptatif
+            if contexts:
+                state["last_atr_pct"] = sum(c.get("atr_pct", 1.0) for c in contexts) / len(contexts)
 
             if not contexts:
                 time.sleep(SCAN_INTERVAL)
