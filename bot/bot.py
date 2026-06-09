@@ -110,6 +110,15 @@ else:
     binance = Client(BINANCE_API_KEY, BINANCE_SECRET)
     log.info("MODE LIVE — attention argent reel")
 
+# Sync horloge avec Binance (evite -1021 timestamp error)
+try:
+    server_ms = binance.get_server_time()["serverTime"]
+    local_ms  = int(time.time() * 1000)
+    binance.timestamp_offset = server_ms - local_ms
+    log.info(f"Timestamp offset Binance: {binance.timestamp_offset}ms")
+except Exception as e:
+    log.warning(f"Impossible de syncer l'horloge Binance: {e}")
+
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 # ─── ETAT GLOBAL ─────────────────────────────────────────────
