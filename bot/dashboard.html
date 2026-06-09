@@ -396,11 +396,11 @@ async function fetchStatus() {
     document.getElementById('chartBadge').textContent = data.testnet ? 'TESTNET' : 'LIVE';
 
     startBalance = bal;
-    addLog('INFO', `Balance: ${bal != null ? '$'+bal.toFixed(2) : '—'} | P&L: ${pnlStr} | Trades: ${data.trades_today}`);
     return data;
   } catch (e) {
-    addLog('ERROR', `Hors ligne — impossible de joindre ${BOT_URL}`);
     document.getElementById('sStatus').innerHTML = '<span style="color:var(--red);font-size:11px">HORS LIGNE</span>';
+    document.getElementById('logFeed').innerHTML =
+      '<div class="log-line"><span class="lvl-error">ERROR</span> <span class="msg">Hors ligne — impossible de joindre ' + BOT_URL + '</span></div>';
     return null;
   }
 }
@@ -535,9 +535,7 @@ function renderSignals(signals, scanning, trending) {
   }).join('');
   grid.innerHTML = chips;
 
-  if (scanning.length) {
-    addLog('INFO', `Scan: ${scanning.slice(0,5).join(' · ')}...`);
-  }
+  // scanning info shown in stats cards, not in log feed
 }
 
 // ── LOG FEED ─────────────────────────────────────────────────
@@ -579,7 +577,7 @@ window.addEventListener('load', () => {
   initChart();
   fetchAll();
   setInterval(fetchAll, REFRESH_MS);
-  addLog('INFO', 'Dashboard démarré — connexion au bot...');
+  document.getElementById('logFeed').innerHTML = '<div class="log-line"><span class="lvl-info">INFO</span> <span class="msg">Dashboard démarré — connexion au bot...</span></div>';
 });
 window.addEventListener('resize', () => { initChart(); drawChart(equityData, startBalance); });
 </script>
