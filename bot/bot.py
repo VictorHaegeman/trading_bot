@@ -1374,23 +1374,35 @@ def run_bot():
             else:
                 tv = state["tv_signals"]
 
-            # Candidats BUY uniquement, excluant les positions deja ouvertes
+            # Candidats LONG (signal positif) + SHORT (signal négatif)
             already_held = set(state["open_exits"].keys())
-            candidates   = [
-                (sym, tv.get(sym, {}).get("rec_all", 0) or 0)
-                for sym in symbols
-                if sym not in already_held
-                and (tv.get(sym, {}).get("rec_all", 0) or 0) > 0.15
-            ]
-            candidates.sort(key=lambda x: x[1], reverse=True)
-            top_cands = candidates[:TOP_CANDIDATES]
+            half = max(2, TOP_CANDIDATES // 2)
+
+            buy_cands = sorted(
+                [(sym, tv.get(sym, {}).get("rec_all", 0) or 0)
+                 for sym in symbols
+                 if sym not in already_held
+                 and (tv.get(sym, {}).get("rec_all", 0) or 0) > 0.15],
+                key=lambda x: x[1], reverse=True
+            )[:half]
+
+            short_cands = sorted(
+                [(sym, tv.get(sym, {}).get("rec_all", 0) or 0)
+                 for sym in symbols
+                 if sym not in already_held
+                 and (tv.get(sym, {}).get("rec_all", 0) or 0) < -0.15],
+                key=lambda x: x[1]  # plus négatif en premier
+            )[:TOP_CANDIDATES - half]
+
+            top_cands = buy_cands + short_cands
 
             if not top_cands:
-                log.info(f"Aucun signal BUY fort ({len(symbols)} paires scannees) — HOLD")
+                log.info(f"Aucun signal fort ({len(symbols)} paires scannees) — HOLD")
                 time.sleep(SCAN_INTERVAL)
                 continue
 
-            log.info(f"Top candidats: {', '.join(f'{s}({r:+.2f})' for s, r in top_cands)}")
+            log.info(f"Top candidats: {', '.join(f'{s}({r:+.2f})' for s, r in top_cands)} "
+                     f"[{len(buy_cands)}L/{len(short_cands)}S]")
             state["current_scan"] = top_cands[0][0]
 
             # Contexte detaille — fetch en parallele (3 threads)
@@ -1424,21 +1436,39 @@ def run_bot():
             perf     = get_perf_stats()
             min_conf = adaptive_min_confidence(perf)
 
-            # Décision IA (avec historique)
-            decision = ask_ai_multi(contexts, perf=perf)
-            symbol   = decision.get("symbol", "NONE")
+            # Boucle multi-trade : jusqu'à 3 trades par cycle (ou MAX_OPEN_POSITIONS)
+            remaining_ctx = list(contexts)
+            trades_this_cycle = 0
+            for _pass in range(3):
+                if not remaining_ctx or len(state["open_exits"]) >= MAX_OPEN_POSITIONS:
+                    break
 
-            if symbol == "NONE" or decision.get("action") == "HOLD":
-                log.info(f"IA HOLD — {decision.get('reasoning', '')}")
-            else:
-                ctx = next((c for c in contexts if c["symbol"] == symbol), contexts[0])
+                decision = ask_ai_multi(remaining_ctx, perf=perf)
+                symbol   = decision.get("symbol", "NONE")
+
+                if symbol == "NONE" or decision.get("action") == "HOLD":
+                    log.info(f"IA HOLD — {decision.get('reasoning', '')}")
+                    break
+
+                ctx = next((c for c in remaining_ctx if c["symbol"] == symbol), None)
+                if not ctx:
+                    break
+
                 approved, reason = risk_gate(decision, ctx, min_conf=min_conf)
                 if not approved:
                     log.info(f"Risk Gate refus: {reason}")
-                    if decision.get("confidence", 0) >= min_conf:
-                        send_telegram(f"*Trade refuse*\n{symbol}: {reason}")
-                else:
-                    execute_trade(decision, ctx)
+                    # Retire ce candidat et essaie le suivant
+                    remaining_ctx = [c for c in remaining_ctx if c["symbol"] != symbol]
+                    continue
+
+                execute_trade(decision, ctx)
+                trades_this_cycle += 1
+                remaining_ctx = [c for c in remaining_ctx if c["symbol"] != symbol]
+
+            if trades_this_cycle == 0 and not any(
+                d.get("action") != "HOLD" for d in [decision] if "decision" in dir()
+            ):
+                pass  # déjà loggué HOLD
 
         except KeyboardInterrupt:
             log.info("Arret manuel du bot")
