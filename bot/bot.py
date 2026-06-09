@@ -92,7 +92,7 @@ MAX_OPEN_POSITIONS    = int(os.getenv("MAX_OPEN_POSITIONS", "8"))
 ALL_SYMBOLS_MIN_VOL   = float(os.getenv("ALL_SYMBOLS_MIN_VOL", "50000"))
 TOP_CANDIDATES        = int(os.getenv("TOP_CANDIDATES", "6"))
 FUTURES_LEVERAGE      = int(os.getenv("FUTURES_LEVERAGE", "2"))     # levier futures (2x par defaut)
-SCAN_INTERVAL         = 60
+SCAN_INTERVAL         = 120   # 2 min — réduit l'usage tokens Groq (1.1M/jour gratuit)
 TV_CACHE_SECS         = 300
 CG_CACHE_SECS         = 600
 
@@ -165,6 +165,14 @@ except Exception as e:
 groq_client   = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 _use_claude   = claude_client is not None
+
+# Rotation des modèles Groq gratuits — limites séparées par modèle
+GROQ_MODELS   = [
+    "llama-3.3-70b-versatile",   # 100k tokens/jour (meilleur)
+    "llama-3.1-8b-instant",      # 500k tokens/jour (fallback rapide)
+    "gemma2-9b-it",              # 500k tokens/jour (fallback backup)
+]
+_groq_model_idx = 0  # index courant dans GROQ_MODELS
 
 # ─── ETAT GLOBAL ─────────────────────────────────────────────
 state = {
@@ -703,6 +711,19 @@ HOLD: {{"symbol":"NONE","action":"HOLD","size_usdt":null,"entry_price":null,"sto
 
     sys_msg = "Expert trading algorithmique. Reponds UNIQUEMENT avec un objet JSON valide, sans texte avant ou apres."
     raw = ""
+
+    def _call_groq(model: str) -> str:
+        resp = groq_client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": sys_msg},
+                {"role": "user",   "content": prompt},
+            ],
+            temperature=0.15,
+            max_tokens=350,
+        )
+        return resp.choices[0].message.content.strip()
+
     try:
         if _use_claude:
             resp = claude_client.messages.create(
@@ -712,42 +733,40 @@ HOLD: {{"symbol":"NONE","action":"HOLD","size_usdt":null,"entry_price":null,"sto
                 system=sys_msg,
                 messages=[{"role": "user", "content": prompt}],
             )
-            raw = resp.content[0].text.strip()
+            raw      = resp.content[0].text.strip()
             provider = f"Claude({AI_MODEL.split('-')[1]})"
         else:
-            resp = groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[
-                    {"role": "system", "content": sys_msg},
-                    {"role": "user",   "content": prompt},
-                ],
-                temperature=0.15,
-                max_tokens=300,
-            )
-            raw = resp.choices[0].message.content.strip()
-            provider = "Groq(llama-70b)"
+            # Rotation automatique sur les modèles Groq gratuits
+            global _groq_model_idx
+            tried = set()
+            last_err = None
+            while len(tried) < len(GROQ_MODELS):
+                model = GROQ_MODELS[_groq_model_idx % len(GROQ_MODELS)]
+                if model in tried:
+                    _groq_model_idx += 1
+                    continue
+                tried.add(model)
+                try:
+                    raw      = _call_groq(model)
+                    provider = f"Groq({model.split('-')[0]}{'70b' if '70b' in model else '8b' if '8b' in model else 'gemma'})"
+                    last_err = None
+                    break
+                except Exception as me:
+                    if "429" in str(me) or "rate_limit" in str(me).lower():
+                        log.warning(f"Rate limit {model} → rotation vers prochain modèle")
+                        _groq_model_idx += 1
+                        last_err = me
+                    else:
+                        raise
+            if last_err:
+                raise last_err
 
         raw      = raw.replace("```json", "").replace("```", "").strip()
         decision = json.loads(raw)
         log.info(f"[{provider}] → {decision.get('symbol','?')} {decision['action']} conf={decision.get('confidence','?')} | {decision.get('reasoning','')[:120]}")
         return decision
     except json.JSONDecodeError:
-        log.error(f"JSON invalide de l'IA: {raw[:200]}")
-        # Si Claude échoue sur le JSON, tente Groq en fallback
-        if _use_claude and groq_client:
-            log.warning("Fallback Groq apres JSON invalide Claude")
-            try:
-                resp2 = groq_client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=[{"role": "system", "content": sys_msg}, {"role": "user", "content": prompt}],
-                    temperature=0.1, max_tokens=300,
-                )
-                raw2     = resp2.choices[0].message.content.strip().replace("```json","").replace("```","").strip()
-                decision = json.loads(raw2)
-                log.info(f"[Groq fallback] → {decision.get('symbol','?')} {decision['action']}")
-                return decision
-            except Exception:
-                pass
+        log.error(f"JSON invalide: {raw[:200]}")
         return {"symbol": "NONE", "action": "HOLD", "confidence": 0, "reasoning": "JSON invalide"}
     except Exception as e:
         log.error(f"AI error: {e}")
@@ -1463,7 +1482,7 @@ def status():
         "scanning":        state["scanning_symbols"][:8],
         "current_scan":    state["current_scan"],
         "loss_streak":     state.get("loss_streak", 0),
-        "ai_provider":     f"Claude({AI_MODEL.split('-')[1]})" if _use_claude else "Groq(llama-70b)",
+        "ai_provider":     f"Claude({AI_MODEL.split('-')[1]})" if _use_claude else f"Groq({GROQ_MODELS[_groq_model_idx % len(GROQ_MODELS)].split('-')[0]})",
     })
 
 @app.route("/logs")
