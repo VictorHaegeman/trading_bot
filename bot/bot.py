@@ -997,12 +997,24 @@ def execute_trade(decision: dict, context: dict):
         state["trades_today"].append(trade_log)
         save_trade_log(trade_log)
 
+        # Marquer la position comme ouverte IMMEDIATEMENT (avant OCO)
+        # pour eviter que le prochain cycle rachete le meme symbole
+        state["open_exits"][symbol] = {
+            "oco_id":      None,
+            "sl":          sl,
+            "tp":          tp,
+            "qty":         qty,
+            "entry_price": fill_price,
+            "is_short":    False,
+        }
+
         # Placement OCO si SL + TP definis
         if sl and tp:
             oco_id = place_exit_orders(symbol, qty, sl, tp, entry_price=fill_price)
             if oco_id:
+                state["open_exits"][symbol]["oco_id"] = oco_id
                 trade_log["oco_id"] = oco_id
-                save_trade_log(trade_log)  # mise a jour avec l'id OCO
+                save_trade_log(trade_log)
 
         sl_pct = abs(fill_price - sl) / fill_price * 100 if sl else 0
         tp_pct = abs(tp - fill_price) / fill_price * 100 if tp else 0
