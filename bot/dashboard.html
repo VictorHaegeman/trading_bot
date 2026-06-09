@@ -195,6 +195,10 @@
         <span class="status-val" id="sStatus"><span class="pill running">RUNNING</span></span>
       </div>
       <div class="status-item">
+        <span class="status-key">AI ENGINE</span>
+        <span class="status-val" id="sAiProvider" style="color:var(--purple);font-size:11px">—</span>
+      </div>
+      <div class="status-item">
         <span class="status-key">MODE</span>
         <span class="status-val" id="sMode"><span class="pill testnet">TESTNET</span></span>
       </div>
@@ -395,6 +399,12 @@ async function fetchStatus() {
     document.getElementById('statPairs').textContent   = scanning.length || '—';
     document.getElementById('statCurrent').textContent = data.current_scan || '—';
     document.getElementById('sScan').textContent       = data.current_scan || '—';
+
+    if (data.ai_provider) {
+      document.getElementById('sAiProvider').textContent = data.ai_provider;
+      document.getElementById('sAiProvider').style.color =
+        data.ai_provider.startsWith('Claude') ? 'var(--purple)' : 'var(--muted)';
+    }
 
     const openSyms = data.open_symbols || [];
     const openEl   = document.getElementById('sOpenPos');

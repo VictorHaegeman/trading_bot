@@ -1,18 +1,20 @@
 """
 =============================================================
-  AI TRADING BOT — Binance x Groq x TradingView x X
-  Version 4.0 — Multi-Crypto — ROI-Optimized — Windows
+  AI TRADING BOT — Binance x Claude/Groq x TradingView x X
+  Version 5.0 — Multi-Crypto — Claude AI — ROI-Optimized
 =============================================================
-  pip install python-binance groq requests python-dotenv flask
+  pip install python-binance groq anthropic requests python-dotenv flask
 
   .env requis (dans le meme dossier que bot.py) :
     BINANCE_API_KEY=...
     BINANCE_SECRET=...
-    GROQ_API_KEY=...
-    TESTNET=true              <- false pour le live
-    TELEGRAM_TOKEN=...        <- optionnel
-    TELEGRAM_CHAT_ID=...      <- optionnel
-    TWITTER_BEARER_TOKEN=...  <- optionnel
+    ANTHROPIC_API_KEY=...    <- Claude AI (prioritaire)
+    GROQ_API_KEY=...         <- fallback si pas de cle Anthropic
+    AI_MODEL=claude-haiku-4-5-20251001  <- optionnel (defaut: haiku)
+    TESTNET=true             <- false pour le live
+    TELEGRAM_TOKEN=...       <- optionnel
+    TELEGRAM_CHAT_ID=...     <- optionnel
+    TWITTER_BEARER_TOKEN=... <- optionnel
 =============================================================
 """
 
@@ -29,6 +31,7 @@ from dotenv import load_dotenv
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from groq import Groq
+import anthropic
 from flask import Flask, request, jsonify, send_from_directory
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -64,6 +67,8 @@ BINANCE_SECRET       = os.getenv("BINANCE_SECRET", "").strip()
 BINANCE_FUTURES_KEY  = os.getenv("BINANCE_FUTURES_KEY", BINANCE_API_KEY).strip()
 BINANCE_FUTURES_SEC  = os.getenv("BINANCE_FUTURES_SECRET", BINANCE_SECRET).strip()
 GROQ_API_KEY         = os.getenv("GROQ_API_KEY", "").strip()
+ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_API_KEY", "").strip()
+AI_MODEL             = os.getenv("AI_MODEL", "claude-haiku-4-5-20251001").strip()
 TELEGRAM_TOKEN       = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID     = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TWITTER_BEARER       = os.getenv("TWITTER_BEARER_TOKEN", "").strip()
@@ -73,6 +78,8 @@ if TELEGRAM_TOKEN and ("COLLE" in TELEGRAM_TOKEN or len(TELEGRAM_TOKEN) < 20):
     TELEGRAM_TOKEN = ""
 if TELEGRAM_CHAT_ID and "COLLE" in TELEGRAM_CHAT_ID:
     TELEGRAM_CHAT_ID = ""
+if ANTHROPIC_API_KEY and ("COLLE" in ANTHROPIC_API_KEY or len(ANTHROPIC_API_KEY) < 20):
+    ANTHROPIC_API_KEY = ""
 
 # Parametres de risque
 MAX_TRADE_PCT         = 0.05    # 5% = ~$50 par trade sur $1000
@@ -101,11 +108,19 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # Verification des cles
-for name, val in [("BINANCE_API_KEY", BINANCE_API_KEY), ("BINANCE_SECRET", BINANCE_SECRET), ("GROQ_API_KEY", GROQ_API_KEY)]:
+for name, val in [("BINANCE_API_KEY", BINANCE_API_KEY), ("BINANCE_SECRET", BINANCE_SECRET)]:
     print(f"[CHECK] {name}: {'OK' if val else 'MANQUANTE'}")
     if not val:
         log.error(f"{name} manquante — verifier le .env")
         sys.exit(1)
+
+if ANTHROPIC_API_KEY:
+    print(f"[CHECK] AI: Claude ({AI_MODEL})")
+elif GROQ_API_KEY:
+    print(f"[CHECK] AI: Groq (llama-3.3-70b-versatile) — ajouter ANTHROPIC_API_KEY pour Claude")
+else:
+    log.error("ANTHROPIC_API_KEY ou GROQ_API_KEY requis — verifier le .env")
+    sys.exit(1)
 
 if TWITTER_BEARER:
     log.info("X/Twitter: cle detectee — sentiment active")
@@ -147,7 +162,9 @@ try:
 except Exception as e:
     log.warning(f"Impossible de syncer l'horloge Binance: {e}")
 
-groq_client = Groq(api_key=GROQ_API_KEY)
+groq_client   = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+_use_claude   = claude_client is not None
 
 # ─── ETAT GLOBAL ─────────────────────────────────────────────
 state = {
@@ -620,7 +637,7 @@ def get_market_context(symbol: str) -> dict:
 
 # ─── DECISION IA MULTI-CRYPTO ─────────────────────────────────
 def ask_ai_multi(contexts: list, perf: dict = None) -> dict:
-    """Passe plusieurs paires candidates a Groq (Llama 3.3 70B) + historique."""
+    """Passe plusieurs paires candidates a Claude (Haiku) ou Groq (fallback) + historique."""
     balance   = contexts[0]["balance_usdt"]
     max_trade = round(balance * MAX_TRADE_PCT, 2)
     fg        = contexts[0]["fear_greed_value"]
@@ -684,25 +701,56 @@ JSON uniquement:
 SHORT ex: {{"symbol":"BTCUSDT","action":"SELL","size_usdt":100.00,"entry_price":105000,"stop_loss":107500,"take_profit":100000,"confidence":0.68,"reasoning":"..."}}
 HOLD: {{"symbol":"NONE","action":"HOLD","size_usdt":null,"entry_price":null,"stop_loss":null,"take_profit":null,"confidence":0.0,"reasoning":"..."}}"""
 
+    sys_msg = "Expert trading algorithmique. Reponds UNIQUEMENT avec un objet JSON valide, sans texte avant ou apres."
+    raw = ""
     try:
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": "Expert trading algorithmique. Reponds UNIQUEMENT avec un objet JSON valide, sans texte avant ou apres."},
-                {"role": "user",   "content": prompt},
-            ],
-            temperature=0.15,
-            max_tokens=300,
-        )
-        raw      = response.choices[0].message.content.strip().replace("```json", "").replace("```", "").strip()
+        if _use_claude:
+            resp = claude_client.messages.create(
+                model=AI_MODEL,
+                max_tokens=400,
+                temperature=0.15,
+                system=sys_msg,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = resp.content[0].text.strip()
+            provider = f"Claude({AI_MODEL.split('-')[1]})"
+        else:
+            resp = groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": sys_msg},
+                    {"role": "user",   "content": prompt},
+                ],
+                temperature=0.15,
+                max_tokens=300,
+            )
+            raw = resp.choices[0].message.content.strip()
+            provider = "Groq(llama-70b)"
+
+        raw      = raw.replace("```json", "").replace("```", "").strip()
         decision = json.loads(raw)
-        log.info(f"IA → {decision.get('symbol','?')} {decision['action']} conf={decision.get('confidence','?')} | {decision.get('reasoning','')}")
+        log.info(f"[{provider}] → {decision.get('symbol','?')} {decision['action']} conf={decision.get('confidence','?')} | {decision.get('reasoning','')[:120]}")
         return decision
     except json.JSONDecodeError:
-        log.error(f"JSON invalide de Groq: {raw}")
+        log.error(f"JSON invalide de l'IA: {raw[:200]}")
+        # Si Claude échoue sur le JSON, tente Groq en fallback
+        if _use_claude and groq_client:
+            log.warning("Fallback Groq apres JSON invalide Claude")
+            try:
+                resp2 = groq_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[{"role": "system", "content": sys_msg}, {"role": "user", "content": prompt}],
+                    temperature=0.1, max_tokens=300,
+                )
+                raw2     = resp2.choices[0].message.content.strip().replace("```json","").replace("```","").strip()
+                decision = json.loads(raw2)
+                log.info(f"[Groq fallback] → {decision.get('symbol','?')} {decision['action']}")
+                return decision
+            except Exception:
+                pass
         return {"symbol": "NONE", "action": "HOLD", "confidence": 0, "reasoning": "JSON invalide"}
     except Exception as e:
-        log.error(f"Groq error: {e}")
+        log.error(f"AI error: {e}")
         return {"symbol": "NONE", "action": "HOLD", "confidence": 0, "reasoning": str(e)}
 
 # ─── RISK GATE ────────────────────────────────────────────────
@@ -1415,6 +1463,7 @@ def status():
         "scanning":        state["scanning_symbols"][:8],
         "current_scan":    state["current_scan"],
         "loss_streak":     state.get("loss_streak", 0),
+        "ai_provider":     f"Claude({AI_MODEL.split('-')[1]})" if _use_claude else "Groq(llama-70b)",
     })
 
 @app.route("/logs")
