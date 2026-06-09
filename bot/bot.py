@@ -1367,6 +1367,31 @@ def check_daily_loss():
                 send_telegram(msg)
 
 # ─── BOUCLE PRINCIPALE ────────────────────────────────────────
+def _restore_daily_pnl():
+    """Relit trades.json pour restaurer daily_pnl_usdt après un restart."""
+    try:
+        if not TRADES_FILE.exists():
+            return
+        today = datetime.now().strftime("%Y-%m-%d")
+        with open(TRADES_FILE) as f:
+            trades = json.load(f)
+        total = 0.0
+        for t in trades:
+            ts = t.get("closed_at") or t.get("timestamp", "")
+            if not ts.startswith(today):
+                continue
+            pnl_u = t.get("pnl_usdt")
+            if pnl_u is not None:
+                total += pnl_u
+            elif t.get("pnl_pct") is not None:
+                # Fallback pour anciens trades sans pnl_usdt
+                total += (t.get("size_usdt") or 50) * t["pnl_pct"]
+        state["daily_pnl_usdt"] = total
+        log.info(f"P&L restauré: ${total:+.2f} USDT (trades fermés aujourd'hui)")
+    except Exception as e:
+        log.warning(f"Restauration P&L: {e}")
+
+
 def recover_open_positions():
     """Au démarrage, relit les ordres OCO Binance ouverts et reconstruit open_exits."""
     try:
@@ -1434,6 +1459,7 @@ def run_bot():
     state["daily_start_balance"] = min(get_balance(), CAPITAL_LIMIT_USDT)
     log.info(f"Balance de depart: ${state['daily_start_balance']:.2f} USDT (cap: ${CAPITAL_LIMIT_USDT})")
     recover_open_positions()  # Recharge les positions ouvertes depuis Binance
+    _restore_daily_pnl()      # Restaure le P&L réalisé aujourd'hui depuis trades.json
 
     while True:
         try:
