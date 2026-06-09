@@ -72,11 +72,12 @@ if TELEGRAM_CHAT_ID and "COLLE" in TELEGRAM_CHAT_ID:
     TELEGRAM_CHAT_ID = ""
 
 # Parametres de risque
-MAX_TRADE_PCT   = 0.20   # Max 20% du capital par trade
-DAILY_LOSS_CAP  = 0.05   # Pause si -5% dans la journee
-SCAN_INTERVAL   = 60     # Secondes entre analyses
-TOP_SYMBOLS_N   = 15     # Nombre de paires a surveiller
-TV_CACHE_SECS   = 300    # Refresh TradingView toutes les 5min
+MAX_TRADE_PCT      = 0.20    # Max 20% du capital par trade
+DAILY_LOSS_CAP     = 0.05    # Pause si -5% dans la journee
+CAPITAL_LIMIT_USDT = float(os.getenv("CAPITAL_LIMIT_USDT", "1000"))  # Capital fictif
+SCAN_INTERVAL      = 60      # Secondes entre analyses
+TOP_SYMBOLS_N      = 15      # Nombre de paires a surveiller
+TV_CACHE_SECS      = 300     # Refresh TradingView toutes les 5min
 CG_CACHE_SECS   = 600    # Refresh CoinGecko trending toutes les 10min
 
 # ─── LOGGING ─────────────────────────────────────────────────
@@ -405,7 +406,7 @@ def get_market_context(symbol: str) -> dict:
     price      = get_price(symbol)
     rsi        = get_rsi(closes)
     fg         = get_fear_greed()      # cached
-    balance    = get_balance()         # cached
+    balance    = min(get_balance(), CAPITAL_LIMIT_USDT)  # cap fictif
     ema20      = sum(closes[-20:]) / 20
     ema50      = sum(closes[-50:]) / min(50, len(closes))
 
@@ -604,12 +605,12 @@ def check_daily_reset():
         state["daily_pnl"]           = 0.0
         state["trades_today"]        = []
         state["paused"]              = False
-        state["daily_start_balance"] = get_balance()
+        state["daily_start_balance"] = min(get_balance(), CAPITAL_LIMIT_USDT)
         log.info("Reset quotidien effectue")
 
 def check_daily_loss():
     if not state["daily_start_balance"]:
-        state["daily_start_balance"] = get_balance()
+        state["daily_start_balance"] = min(get_balance(), CAPITAL_LIMIT_USDT)
         return
     current = get_balance()
     pnl_pct = (current - state["daily_start_balance"]) / state["daily_start_balance"]
@@ -752,7 +753,7 @@ def signals_endpoint():
 @app.route("/status")
 def status():
     try:
-        balance = get_balance()
+        balance = min(get_balance(), CAPITAL_LIMIT_USDT)
     except:
         balance = None
     return jsonify({
@@ -762,6 +763,7 @@ def status():
         "daily_pnl_pct": round(state["daily_pnl"] * 100, 2),
         "trades_today":  len(state["trades_today"]),
         "balance_usdt":  balance,
+        "capital_limit": CAPITAL_LIMIT_USDT,
         "last_signal":   state["last_signal"],
         "scanning":      state["scanning_symbols"][:5],
         "current_scan":  state["current_scan"],

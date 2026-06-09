@@ -364,10 +364,12 @@ async function fetchStatus() {
       ? '<span class="pill testnet">TESTNET</span>'
       : '<span class="pill running">LIVE</span>';
 
-    const bal = data.balance_usdt;
-    document.getElementById('sBalance').textContent   = bal ? `$${bal.toFixed(2)}` : '—';
+    const bal   = data.balance_usdt;
+    const capLbl = data.capital_limit ? ` / $${data.capital_limit.toFixed(0)} cap` : '';
+    document.getElementById('sBalance').textContent   = bal ? `$${bal.toFixed(2)}${capLbl}` : '—';
     document.getElementById('sBalance').className     = 'status-val blue';
     document.getElementById('statBalance').textContent = bal ? `$${bal.toFixed(0)}` : '—';
+    document.getElementById('statBalanceSub').textContent = data.capital_limit ? `capital fictif $${data.capital_limit.toFixed(0)}` : '—';
 
     const pnl    = data.daily_pnl_pct;
     const pnlStr = pnl >= 0 ? `+${pnl.toFixed(2)}%` : `${pnl.toFixed(2)}%`;
