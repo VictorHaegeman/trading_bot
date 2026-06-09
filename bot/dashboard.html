@@ -451,8 +451,9 @@ function buildEquityData(trades) {
   let balance = startBalance || 1000;
   const points = [{ balance, trade: null }];
   trades.forEach(t => {
-    // Applique le PnL reel si disponible (trades clotures)
-    if (t.pnl_pct != null) balance = balance * (1 + t.pnl_pct);
+    // pnl_usdt = vrais dollars gagnés/perdus (évite distorsion % sur total balance)
+    if (t.pnl_usdt != null)      balance += t.pnl_usdt;
+    else if (t.pnl_pct != null)  balance += (t.size_usdt || 50) * t.pnl_pct;
     points.push({ balance, trade: t.action, time: t.timestamp ? new Date(t.timestamp).toLocaleTimeString('fr-FR') : '?' });
   });
   equityData = points;

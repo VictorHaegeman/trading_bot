@@ -178,6 +178,7 @@ _groq_model_idx = 0  # index courant dans GROQ_MODELS
 # ─── ETAT GLOBAL ─────────────────────────────────────────────
 state = {
     "daily_pnl":           0.0,
+    "daily_pnl_usdt":      0.0,   # P&L réalisé en $ (robuste testnet)
     "daily_start_balance": None,
     "paused":              False,
     "paused_until":        0,       # timestamp de fin de pause temporaire
@@ -960,27 +961,36 @@ def place_exit_orders(symbol: str, qty: float, stop_loss: float,
 
 def _close_position(sym: str, info: dict, fill_px: float, is_short: bool = False):
     """Traite la cloture d'une position — PnL, streak, log, trades.json."""
-    entry_px = info.get("entry_price", fill_px)
-    sl_px    = info.get("sl", 0)
-    # Pour un SHORT, le SL est au-dessus de l'entree
+    entry_px  = info.get("entry_price", fill_px)
+    sl_px     = info.get("sl", 0)
+    qty       = info.get("qty", 0)
+    trade_val = qty * entry_px if entry_px else 0   # valeur USDT du trade
+
+    # PnL en % du coin
     if is_short:
-        pnl = (entry_px - fill_px) / entry_px * 100 if entry_px else 0
-        is_sl = fill_px >= sl_px * 0.998
+        pnl_pct = (entry_px - fill_px) / entry_px * 100 if entry_px else 0
+        is_sl   = fill_px >= sl_px * 0.998
     else:
-        pnl = (fill_px - entry_px) / entry_px * 100 if entry_px else 0
-        is_sl = fill_px <= sl_px * 1.002
+        pnl_pct = (fill_px - entry_px) / entry_px * 100 if entry_px else 0
+        is_sl   = fill_px <= sl_px * 1.002
+
+    # PnL en dollars absolus (pour le dashboard et daily_pnl)
+    pnl_usdt = trade_val * (pnl_pct / 100)
 
     outcome = "LOSS" if is_sl else "WIN"
     if is_sl:
         state["loss_streak"] = state.get("loss_streak", 0) + 1
-        log.warning(f"SL {sym} @ ${fill_px:.4g} | PnL {pnl:+.2f}% | streak {state['loss_streak']}")
-        send_telegram(f"{'SHORT' if is_short else 'LONG'} SL *{sym}* `{pnl:+.2f}%` streak:{state['loss_streak']}")
+        log.warning(f"SL {sym} @ ${fill_px:.4g} | PnL {pnl_pct:+.2f}% (${pnl_usdt:+.2f}) | streak {state['loss_streak']}")
+        send_telegram(f"{'SHORT' if is_short else 'LONG'} SL *{sym}* `{pnl_pct:+.2f}%` (${pnl_usdt:+.2f}) streak:{state['loss_streak']}")
     else:
         state["loss_streak"] = 0
-        log.info(f"TP {sym} @ ${fill_px:.4g} | PnL {pnl:+.2f}%")
-        send_telegram(f"{'SHORT' if is_short else 'LONG'} TP *{sym}* `{pnl:+.2f}%` WIN")
+        log.info(f"TP {sym} @ ${fill_px:.4g} | PnL {pnl_pct:+.2f}% (${pnl_usdt:+.2f})")
+        send_telegram(f"{'SHORT' if is_short else 'LONG'} TP *{sym}* `{pnl_pct:+.2f}%` (${pnl_usdt:+.2f}) WIN")
 
-    update_trade_outcome(sym, info.get("oco_id"), pnl / 100, outcome)
+    # Accumule dans le daily_pnl_usdt (robuste sur testnet avec balance >cap)
+    state["daily_pnl_usdt"] = state.get("daily_pnl_usdt", 0.0) + pnl_usdt
+
+    update_trade_outcome(sym, info.get("oco_id"), pnl_pct / 100, outcome, pnl_usdt)
 
 
 def sync_open_positions():
@@ -1224,7 +1234,7 @@ def save_trade_log(trade: dict):
         log.error(f"Erreur save trade log: {e}")
 
 
-def update_trade_outcome(symbol: str, order_id, pnl_pct: float, outcome: str):
+def update_trade_outcome(symbol: str, order_id, pnl_pct: float, outcome: str, pnl_usdt: float = None):
     """Ecrit le resultat (WIN/LOSS + PnL%) dans trades.json pour apprentissage."""
     try:
         log_file = SCRIPT_DIR / "trades.json"
@@ -1234,8 +1244,9 @@ def update_trade_outcome(symbol: str, order_id, pnl_pct: float, outcome: str):
             logs = json.load(f)
         for t in reversed(logs):
             if t.get("symbol") == symbol and t.get("oco_id") is not None:
-                t["pnl_pct"]  = round(pnl_pct, 4)
-                t["outcome"]  = outcome
+                t["pnl_pct"]   = round(pnl_pct, 4)
+                t["pnl_usdt"]  = round(pnl_usdt, 4) if pnl_usdt is not None else None
+                t["outcome"]   = outcome
                 t["closed_at"] = datetime.now().isoformat()
                 break
         with open(log_file, "w") as f:
@@ -1309,6 +1320,7 @@ def check_daily_reset():
     now = datetime.now()
     if now.hour == 0 and now.minute < 2:
         state["daily_pnl"]           = 0.0
+        state["daily_pnl_usdt"]      = 0.0
         state["trades_today"]        = []
         state["paused"]              = False
         state["paused_until"]        = 0
@@ -1319,10 +1331,12 @@ def check_daily_reset():
 
 def check_daily_loss():
     if not state["daily_start_balance"]:
-        state["daily_start_balance"] = min(get_balance(), CAPITAL_LIMIT_USDT)
+        state["daily_start_balance"] = CAPITAL_LIMIT_USDT
         return
-    current = min(get_balance(), CAPITAL_LIMIT_USDT)
-    pnl_pct = (current - state["daily_start_balance"]) / state["daily_start_balance"]
+    # P&L basé sur les trades réalisés (robuste testnet/live)
+    # Le testnet a 10k USDT libre → min(balance, cap) = cap toujours → faux 0%
+    pnl_usdt = state.get("daily_pnl_usdt", 0.0)
+    pnl_pct  = pnl_usdt / CAPITAL_LIMIT_USDT
     state["daily_pnl"] = pnl_pct
 
     # Perte journaliere maximale atteinte → pause jusqu'a minuit
