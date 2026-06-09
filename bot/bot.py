@@ -21,6 +21,7 @@
 import os
 import sys
 import json
+import re
 import time
 import logging
 import requests
@@ -644,6 +645,34 @@ def get_market_context(symbol: str) -> dict:
     }
 
 # ─── DECISION IA MULTI-CRYPTO ─────────────────────────────────
+def _parse_ai_json(text: str) -> dict:
+    """Extrait un objet JSON valide même si le modèle ajoute du texte autour."""
+    text = text.strip()
+    # Retire les blocs markdown ```json ... ```
+    text = re.sub(r"```(?:json)?\s*", "", text).replace("```", "").strip()
+    # Tente direct
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # Cherche le premier {...} complet avec comptage des accolades
+    depth, start = 0, -1
+    for i, c in enumerate(text):
+        if c == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0 and start != -1:
+                try:
+                    return json.loads(text[start:i+1])
+                except json.JSONDecodeError:
+                    pass
+                start = -1
+    raise json.JSONDecodeError("Aucun JSON trouvé", text, 0)
+
+
 def ask_ai_multi(contexts: list, perf: dict = None) -> dict:
     """Passe plusieurs paires candidates a Claude (Haiku) ou Groq (fallback) + historique."""
     balance   = contexts[0]["balance_usdt"]
@@ -761,8 +790,7 @@ HOLD: {{"symbol":"NONE","action":"HOLD","size_usdt":null,"entry_price":null,"sto
             if last_err:
                 raise last_err
 
-        raw      = raw.replace("```json", "").replace("```", "").strip()
-        decision = json.loads(raw)
+        decision = _parse_ai_json(raw)
         log.info(f"[{provider}] → {decision.get('symbol','?')} {decision['action']} conf={decision.get('confidence','?')} | {decision.get('reasoning','')[:120]}")
         return decision
     except json.JSONDecodeError:
