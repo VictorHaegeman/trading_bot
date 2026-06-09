@@ -895,14 +895,18 @@ def place_exit_orders(symbol: str, qty: float, stop_loss: float,
         tp       = round_price(take_profit, tick)
         sl_limit = round_price(sl * 0.9985, tick)  # 0.15% sous le stop
 
-        oco = binance.order_oco_sell(
-            symbol=symbol,
-            quantity=qty,
-            price=str(tp),
-            stopPrice=str(sl),
-            stopLimitPrice=str(sl_limit),
-            stopLimitTimeInForce="GTC",
-        )
+        # Nouveau format OCO Binance (api/v3/orderList/oco)
+        oco = binance._post("orderList/oco", True, data={
+            "symbol":            symbol,
+            "side":              "SELL",
+            "quantity":          str(qty),
+            "aboveType":         "LIMIT_MAKER",
+            "abovePrice":        str(tp),
+            "belowType":         "STOP_LOSS_LIMIT",
+            "belowStopPrice":    str(sl),
+            "belowPrice":        str(sl_limit),
+            "belowTimeInForce":  "GTC",
+        })
         oco_id = oco.get("orderListId", "?")
         log.info(f"OCO place: {symbol} TP=${tp} SL=${sl} (list #{oco_id})")
         state["open_exits"][symbol] = {
