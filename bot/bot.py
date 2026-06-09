@@ -867,12 +867,15 @@ def risk_gate(decision: dict, context: dict, min_conf: float = None) -> tuple:
     if vol_ratio < 0.3:
         return False, f"Volume trop faible ({vol_ratio}x < 0.3x)"
 
-    # R:R minimum 1.5 (assoupli depuis 1.8)
+    # R:R minimum 1.5 — auto-corriger le TP plutôt que rejeter
     if entry and sl and tp:
         risk   = abs(entry - sl)
         reward = abs(tp - entry)
         if risk > 0 and (reward / risk) < 1.5:
-            return False, f"R:R {reward/risk:.2f} < 1.5"
+            # L'AI a bien identifié la direction et le SL — on force le TP à 1.5×risk
+            new_tp = (entry + risk * 1.5) if action == "BUY" else (entry - risk * 1.5)
+            log.info(f"Risk Gate: TP auto-corrigé {tp:.6g} → {new_tp:.6g} (R:R forcé 1.5)")
+            decision["take_profit"] = new_tp
 
     # SL max 3.5% (assoupli depuis 2.5%)
     if entry and sl:
