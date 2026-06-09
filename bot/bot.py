@@ -30,8 +30,22 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from groq import Groq
 from flask import Flask, request, jsonify, send_from_directory
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import threading
 import webbrowser
+
+
+# ─── HTTP SESSION AVEC RETRY/POOLING ─────────────────────────
+def _make_session() -> requests.Session:
+    s = requests.Session()
+    retry = Retry(total=3, backoff_factor=0.4, status_forcelist=(429, 500, 502, 503, 504))
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=20)
+    s.mount("https://", adapter)
+    s.mount("http://",  adapter)
+    return s
+
+http = _make_session()
 
 # ─── FORCE UTF-8 ─────────────────────────────────────────────
 if sys.platform == "win32":
@@ -119,7 +133,7 @@ def send_telegram(message: str):
         return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}, timeout=5)
+        http.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}, timeout=5)
     except Exception as e:
         log.error(f"Telegram error: {e}")
 
@@ -173,7 +187,7 @@ def get_fear_greed() -> dict:
     if now - _fg_cache["ts"] < 300 and _fg_cache["value"]:
         return _fg_cache["value"]
     try:
-        r = requests.get("https://api.alternative.me/fng/", timeout=5)
+        r = http.get("https://api.alternative.me/fng/", timeout=5)
         d = r.json()["data"][0]
         result = {"value": int(d["value"]), "label": d["value_classification"]}
         _fg_cache["value"] = result
@@ -244,7 +258,7 @@ def get_tv_signals(symbols: list) -> dict:
             "Origin":       "https://www.tradingview.com",
             "Content-Type": "application/json",
         }
-        r = requests.post(url, json=payload, headers=headers, timeout=15)
+        r = http.post(url, json=payload, headers=headers, timeout=15)
         results = {}
         for row in r.json().get("data", []):
             sym = row["s"].replace("BINANCE:", "")
@@ -284,7 +298,7 @@ def get_x_sentiment(symbol: str) -> dict:
     base = symbol.replace("USDT", "").upper()
     query = f"${base} OR #{base.lower()} crypto -is:retweet lang:en"
     try:
-        r = requests.get(
+        r = http.get(
             "https://api.twitter.com/2/tweets/search/recent",
             headers={"Authorization": f"Bearer {TWITTER_BEARER}"},
             params={"query": query, "max_results": 10, "tweet.fields": "public_metrics"},
@@ -311,6 +325,54 @@ def get_x_sentiment(symbol: str) -> dict:
         log.warning(f"X sentiment error: {e}")
         return {"available": False}
 
+# ─── FUTURES SIGNALS (PUBLICS, SANS AUTH) ────────────────────
+_futures_cache: dict = {}
+
+def get_futures_context(symbol: str) -> dict:
+    """
+    Recupere funding rate et open interest via l'API publique Binance Futures.
+    Ces donnees sont disponibles meme depuis un compte spot/testnet.
+    Funding rate > +0.05% = marche overleveraged long (bearish)
+    Funding rate < -0.05% = marche overleveraged short (bullish)
+    """
+    now = time.time()
+    cached = _futures_cache.get(symbol)
+    if cached and now - cached["ts"] < 60:
+        return cached["data"]
+
+    result = {"funding_rate": None, "open_interest": None, "funding_label": "N/A"}
+    try:
+        r = http.get(
+            "https://fapi.binance.com/fapi/v1/premiumIndex",
+            params={"symbol": symbol},
+            timeout=5,
+        )
+        if r.status_code == 200:
+            d = r.json()
+            fr = float(d.get("lastFundingRate", 0))
+            result["funding_rate"] = round(fr * 100, 4)
+            result["funding_label"] = (
+                "OVERLEV LONG"  if fr >  0.0005 else
+                "OVERLEV SHORT" if fr < -0.0005 else
+                "NEUTRE"
+            )
+    except Exception as e:
+        log.debug(f"funding rate {symbol}: {e}")
+
+    try:
+        r = http.get(
+            "https://fapi.binance.com/fapi/v1/openInterest",
+            params={"symbol": symbol},
+            timeout=5,
+        )
+        if r.status_code == 200:
+            result["open_interest"] = float(r.json().get("openInterest", 0))
+    except Exception as e:
+        log.debug(f"open interest {symbol}: {e}")
+
+    _futures_cache[symbol] = {"data": result, "ts": now}
+    return result
+
 # ─── COINGECKO TRENDING ───────────────────────────────────────
 def get_trending_coins() -> list:
     """Coins trending sur CoinGecko (cache 10min)."""
@@ -318,7 +380,7 @@ def get_trending_coins() -> list:
     if now - state["last_cg_update"] < CG_CACHE_SECS:
         return state["trending"]
     try:
-        r = requests.get("https://api.coingecko.com/api/v3/search/trending", timeout=8)
+        r = http.get("https://api.coingecko.com/api/v3/search/trending", timeout=8)
         coins = [c["item"]["symbol"].upper() + "USDT" for c in r.json().get("coins", [])]
         state["trending"] = coins
         state["last_cg_update"] = now
@@ -342,6 +404,8 @@ def get_market_context(symbol: str) -> dict:
     vols       = [k["volume"] for k in klines_15m]
     vol_ratio  = round(vols[-1] / (sum(vols) / len(vols)), 2) if vols else 1.0
 
+    futures = get_futures_context(symbol)
+
     return {
         "symbol":           symbol,
         "price":            price,
@@ -356,6 +420,9 @@ def get_market_context(symbol: str) -> dict:
         "balance_usdt":     round(balance, 2),
         "daily_pnl_pct":    round(state["daily_pnl"], 4),
         "open_positions":   get_open_positions(symbol),
+        "funding_rate":     futures["funding_rate"],
+        "funding_label":    futures["funding_label"],
+        "open_interest":    futures["open_interest"],
     }
 
 # ─── DECISION IA MULTI-CRYPTO ─────────────────────────────────
@@ -373,12 +440,14 @@ def ask_ai_multi(contexts: list) -> dict:
         x   = ctx.get("x_sentiment", {})
         x_str = f"  X/Twitter: {x['label']} ({x['score']:.0f}/100, {x['count']} tweets)" if x.get("available") else ""
         trending_flag = " [TRENDING CG]" if ctx["symbol"] in trending else ""
+        fr = ctx.get("funding_rate")
+        fr_str = f"  Funding: {fr:+.4f}% ({ctx.get('funding_label','N/A')})" if fr is not None else ""
         cands_text += f"""
 ▸ {ctx['symbol']}{trending_flag}
   Prix: ${ctx['price']:,.6g}  |  RSI(14): {ctx['rsi_14']}  |  Vol ratio: {ctx['volume_ratio']}x
   EMA20: ${ctx['ema20']:,.6g} ({ctx['price_vs_ema20']}) | EMA50: ${ctx['ema50']:,.6g} ({ctx['price_vs_ema50']})
   TradingView: {tv.get('label','N/A')} (score {rec:+.2f}) | MACD: {tv.get('macd',0) or 0:.4g} vs {tv.get('macd_signal',0) or 0:.4g}
-  Positions ouvertes: {len(ctx['open_positions'])}{x_str}
+  Positions ouvertes: {len(ctx['open_positions'])}{fr_str}{x_str}
 """
 
     prompt = f"""Tu es un trader algorithmique expert sur Binance. Analyse ces {len(contexts)} paires et choisis le MEILLEUR setup maintenant.
@@ -658,10 +727,15 @@ def signals_endpoint():
         key=lambda x: abs(x[1].get("rec_all", 0) or 0),
         reverse=True,
     )[:10]
+    # Enrich avec funding rates
+    enriched = {}
+    for sym, data in top:
+        futures = get_futures_context(sym)
+        enriched[sym] = {**data, **futures}
     return jsonify({
         "scanning":     state["scanning_symbols"],
         "current":      state["current_scan"],
-        "tv_signals":   {sym: data for sym, data in top},
+        "tv_signals":   enriched,
         "trending":     get_trending_coins()[:5],
         "last_updated": state["last_tv_update"],
     })

@@ -522,10 +522,13 @@ function renderSignals(signals, scanning, trending) {
     const volR       = s.vol_ratio ? `${s.vol_ratio.toFixed(1)}x` : '—';
     const chg        = s.change_pct != null ? `${s.change_pct >= 0?'+':''}${s.change_pct.toFixed(2)}%` : '';
     const chgColor   = s.change_pct >= 0 ? 'var(--green)' : 'var(--red)';
+    const fr         = s.funding_rate != null ? `${s.funding_rate >= 0?'+':''}${Number(s.funding_rate).toFixed(4)}%` : null;
+    const frColor    = s.funding_rate > 0.05 ? 'var(--red)' : s.funding_rate < -0.05 ? 'var(--green)' : 'var(--muted)';
+    const frHtml     = fr ? `<span style="color:${frColor};font-size:9px;margin-left:6px">FR ${fr}</span>` : '';
     return `
       <div class="sig-chip ${chipClass}">
         <div class="sig-sym">${sym.replace('USDT','')}/${sym.includes('USDT')?'USDT':''}${isTrending?'<span class="trending-tag">▲TRD</span>':''}</div>
-        <div class="sig-price">${price} <span style="color:${chgColor};font-size:10px">${chg}</span></div>
+        <div class="sig-price">${price} <span style="color:${chgColor};font-size:10px">${chg}</span>${frHtml}</div>
         <span class="sig-label ${labelClass}">${label}</span>
         <div class="sig-meta">RSI ${rsi} · Vol ${volR}</div>
       </div>`;
