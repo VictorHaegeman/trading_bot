@@ -79,7 +79,7 @@ MAX_DAILY_TRADES      = int(os.getenv("MAX_DAILY_TRADES", "12"))   # 12 trades/j
 MAX_LOSS_STREAK       = int(os.getenv("MAX_LOSS_STREAK", "3"))     # pause apres 3 pertes consecutives
 MIN_CONFIDENCE        = float(os.getenv("MIN_CONFIDENCE", "0.65"))
 MAX_OPEN_POSITIONS    = int(os.getenv("MAX_OPEN_POSITIONS", "8"))  # max positions simultanées
-ALL_SYMBOLS_MIN_VOL   = float(os.getenv("ALL_SYMBOLS_MIN_VOL", "200000"))  # vol 24h min en USDT
+ALL_SYMBOLS_MIN_VOL   = float(os.getenv("ALL_SYMBOLS_MIN_VOL", "50000"))   # vol 24h min en USDT
 TOP_CANDIDATES        = int(os.getenv("TOP_CANDIDATES", "5"))      # candidats analyses en detail
 SCAN_INTERVAL         = 60
 TV_CACHE_SECS         = 300
@@ -713,8 +713,8 @@ def risk_gate(decision: dict, context: dict) -> tuple:
 
     # Volume minimum
     vol_ratio = context.get("volume_ratio", 1.0)
-    if vol_ratio < 0.7:
-        return False, f"Volume insuffisant ({vol_ratio}x < 0.7x)"
+    if vol_ratio < 0.5:
+        return False, f"Volume insuffisant ({vol_ratio}x < 0.5x)"
 
     # Biais 4h : contre-tendance requiert conf > 0.82
     bias_4h = context.get("bias_4h", "NEUTRE")
