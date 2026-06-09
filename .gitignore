@@ -1,0 +1,22 @@
+# Secrets
+bot/.env
+
+# Logs & data
+bot/bot.log
+bot/trades.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.cursor/
+
+# Jolli internal
+.jolli/jollimemory/debug.log
+.jolli/jollimemory/cursors.json

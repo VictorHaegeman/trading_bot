@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "trading-bot",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["bot/bot.py"],
+      "port": 5000
+    }
+  ]
+}
