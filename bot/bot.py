@@ -72,16 +72,18 @@ if TELEGRAM_CHAT_ID and "COLLE" in TELEGRAM_CHAT_ID:
     TELEGRAM_CHAT_ID = ""
 
 # Parametres de risque
-MAX_TRADE_PCT      = 0.15    # Max 15% du capital par trade (reduit pour diversification)
-DAILY_LOSS_CAP     = 0.04    # Pause si -4% dans la journee
-CAPITAL_LIMIT_USDT = float(os.getenv("CAPITAL_LIMIT_USDT", "1000"))
-MAX_DAILY_TRADES   = int(os.getenv("MAX_DAILY_TRADES", "6"))    # max 6 trades/jour
-MAX_LOSS_STREAK    = int(os.getenv("MAX_LOSS_STREAK", "3"))     # pause apres 3 pertes consecutives
-MIN_CONFIDENCE     = float(os.getenv("MIN_CONFIDENCE", "0.65")) # seuil minimum IA
-SCAN_INTERVAL      = 60
-TOP_SYMBOLS_N      = 15
-TV_CACHE_SECS      = 300
-CG_CACHE_SECS      = 600
+MAX_TRADE_PCT         = 0.10    # 10% du capital par trade (max 10 positions simultanées)
+DAILY_LOSS_CAP        = 0.04    # Pause si -4% dans la journee
+CAPITAL_LIMIT_USDT    = float(os.getenv("CAPITAL_LIMIT_USDT", "1000"))
+MAX_DAILY_TRADES      = int(os.getenv("MAX_DAILY_TRADES", "12"))   # 12 trades/jour max
+MAX_LOSS_STREAK       = int(os.getenv("MAX_LOSS_STREAK", "3"))     # pause apres 3 pertes consecutives
+MIN_CONFIDENCE        = float(os.getenv("MIN_CONFIDENCE", "0.65"))
+MAX_OPEN_POSITIONS    = int(os.getenv("MAX_OPEN_POSITIONS", "8"))  # max positions simultanées
+ALL_SYMBOLS_MIN_VOL   = float(os.getenv("ALL_SYMBOLS_MIN_VOL", "200000"))  # vol 24h min en USDT
+TOP_CANDIDATES        = int(os.getenv("TOP_CANDIDATES", "5"))      # candidats analyses en detail
+SCAN_INTERVAL         = 60
+TV_CACHE_SECS         = 300
+CG_CACHE_SECS         = 600
 
 # ─── LOGGING ─────────────────────────────────────────────────
 logging.basicConfig(
@@ -154,22 +156,23 @@ def send_telegram(message: str):
         log.error(f"Telegram error: {e}")
 
 # ─── DONNEES BINANCE ─────────────────────────────────────────
-def get_top_symbols(n: int = TOP_SYMBOLS_N) -> list:
-    """Top N paires USDT par volume 24h (exclut les tokens levier)."""
+def get_all_symbols() -> list:
+    """Toutes les paires USDT de Binance avec volume suffisant, sans tokens levier."""
     try:
+        excluded = ["DOWN", "UP", "BEAR", "BULL", "3L", "3S", "2L", "2S", "BUSD"]
         tickers = binance.get_ticker()
         pairs = [
             t for t in tickers
             if t["symbol"].endswith("USDT")
-            and not any(x in t["symbol"] for x in ["DOWN", "UP", "BEAR", "BULL", "3L", "3S"])
-            and float(t.get("quoteVolume", 0)) > 500_000
+            and not any(x in t["symbol"] for x in excluded)
+            and float(t.get("quoteVolume", 0)) > ALL_SYMBOLS_MIN_VOL
         ]
         pairs.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
-        result = [t["symbol"] for t in pairs[:n]]
-        log.info(f"Top {n} paires: {', '.join(result[:5])}...")
+        result = [t["symbol"] for t in pairs]
+        log.info(f"Univers: {len(result)} paires USDT (vol>{'%.0fk' % (ALL_SYMBOLS_MIN_VOL/1000)}/24h)")
         return result
     except Exception as e:
-        log.warning(f"get_top_symbols error: {e}")
+        log.warning(f"get_all_symbols error: {e}")
         return ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]
 
 def get_price(symbol: str) -> float:
@@ -282,59 +285,70 @@ def get_atr(klines: list, period: int = 14) -> float:
     return sum(trs) / len(trs)
 
 # ─── TRADINGVIEW SCREENER ─────────────────────────────────────
+def _parse_tv_row(row: dict) -> tuple:
+    """Extrait (symbol, signal_dict) d'une ligne de reponse TV."""
+    sym = row["s"].replace("BINANCE:", "")
+    d   = row["d"]
+    rec = float(d[8]) if d[8] is not None else 0.0
+    return sym, {
+        "price":       d[1],
+        "rsi":         d[2],
+        "rsi_prev":    d[3],
+        "ema20":       d[4],
+        "ema50":       d[5],
+        "macd":        d[6],
+        "macd_signal": d[7],
+        "rec_all":     rec,
+        "rec_ma":      float(d[9]) if d[9] is not None else 0.0,
+        "rec_other":   float(d[10]) if d[10] is not None else 0.0,
+        "vol_ratio":   d[11],
+        "change_pct":  d[12],
+        "label": (
+            "FORT ACHAT" if rec > 0.5  else
+            "ACHAT"      if rec > 0.2  else
+            "FORT VENTE" if rec < -0.5 else
+            "VENTE"      if rec < -0.2 else
+            "NEUTRE"
+        ),
+    }
+
+_TV_COLUMNS = [
+    "name", "close", "RSI", "RSI[1]",
+    "EMA20", "EMA50", "MACD.macd", "MACD.signal",
+    "Recommend.All", "Recommend.MA", "Recommend.Other",
+    "relative_volume_10d_calc", "change",
+]
+_TV_HEADERS = {
+    "User-Agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Referer":      "https://www.tradingview.com",
+    "Origin":       "https://www.tradingview.com",
+    "Content-Type": "application/json",
+}
+
 def get_tv_signals(symbols: list) -> dict:
-    """Signaux TradingView via screener public (sans auth)."""
-    try:
-        url = "https://scanner.tradingview.com/crypto/scan"
-        tickers = [f"BINANCE:{s}" for s in symbols]
-        payload = {
-            "symbols": {"tickers": tickers},
-            "columns": [
-                "name", "close", "RSI", "RSI[1]",
-                "EMA20", "EMA50",
-                "MACD.macd", "MACD.signal",
-                "Recommend.All", "Recommend.MA", "Recommend.Other",
-                "relative_volume_10d_calc", "change",
-            ],
-        }
-        headers = {
-            "User-Agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Referer":      "https://www.tradingview.com",
-            "Origin":       "https://www.tradingview.com",
-            "Content-Type": "application/json",
-        }
-        r = http.post(url, json=payload, headers=headers, timeout=15)
-        results = {}
-        for row in r.json().get("data", []):
-            sym = row["s"].replace("BINANCE:", "")
-            d   = row["d"]
-            rec = float(d[8]) if d[8] is not None else 0.0
-            results[sym] = {
-                "price":       d[1],
-                "rsi":         d[2],
-                "rsi_prev":    d[3],
-                "ema20":       d[4],
-                "ema50":       d[5],
-                "macd":        d[6],
-                "macd_signal": d[7],
-                "rec_all":     rec,
-                "rec_ma":      float(d[9]) if d[9] is not None else 0.0,
-                "rec_other":   float(d[10]) if d[10] is not None else 0.0,
-                "vol_ratio":   d[11],
-                "change_pct":  d[12],
-                "label": (
-                    "FORT ACHAT" if rec > 0.5  else
-                    "ACHAT"      if rec > 0.2  else
-                    "FORT VENTE" if rec < -0.5 else
-                    "VENTE"      if rec < -0.2 else
-                    "NEUTRE"
-                ),
+    """Signaux TradingView pour une grande liste de symboles, par batches de 100."""
+    url        = "https://scanner.tradingview.com/crypto/scan"
+    BATCH      = 100
+    all_res    = {}
+    batches    = [symbols[i:i+BATCH] for i in range(0, len(symbols), BATCH)]
+
+    for idx, batch in enumerate(batches):
+        try:
+            payload = {
+                "symbols":  {"tickers": [f"BINANCE:{s}" for s in batch]},
+                "columns":  _TV_COLUMNS,
             }
-        log.info(f"TradingView: {len(results)} signaux recus")
-        return results
-    except Exception as e:
-        log.error(f"TradingView screener error: {e}")
-        return {}
+            r = http.post(url, json=payload, headers=_TV_HEADERS, timeout=20)
+            for row in r.json().get("data", []):
+                sym, sig = _parse_tv_row(row)
+                all_res[sym] = sig
+        except Exception as e:
+            log.error(f"TV batch {idx+1}/{len(batches)} error: {e}")
+        if idx < len(batches) - 1:
+            time.sleep(0.25)
+
+    log.info(f"TradingView: {len(all_res)}/{len(symbols)} signaux ({len(batches)} batches)")
+    return all_res
 
 # ─── X / TWITTER SENTIMENT ───────────────────────────────────
 def get_x_sentiment(symbol: str) -> dict:
@@ -728,14 +742,14 @@ def risk_gate(decision: dict, context: dict) -> tuple:
     return True, "OK"
 
 # ─── OCO EXIT ORDERS ──────────────────────────────────────────
-def place_exit_orders(symbol: str, qty: float, stop_loss: float, take_profit: float):
+def place_exit_orders(symbol: str, qty: float, stop_loss: float,
+                      take_profit: float, entry_price: float = 0.0):
     """Place un ordre OCO (SL + TP simultanes) apres un achat spot."""
     try:
-        tick = get_tick_size(symbol)
-        sl   = round_price(stop_loss, tick)
-        tp   = round_price(take_profit, tick)
-        # OCO: listClientOrderId automatique, stopPrice = SL, price (limit) = SL-1tick (protection)
-        sl_limit = round_price(sl * 0.9985, tick)  # 0.15% sous le stop pour garantir l'execution
+        tick     = get_tick_size(symbol)
+        sl       = round_price(stop_loss, tick)
+        tp       = round_price(take_profit, tick)
+        sl_limit = round_price(sl * 0.9985, tick)  # 0.15% sous le stop
 
         oco = binance.order_oco_sell(
             symbol=symbol,
@@ -746,12 +760,64 @@ def place_exit_orders(symbol: str, qty: float, stop_loss: float, take_profit: fl
             stopLimitTimeInForce="GTC",
         )
         oco_id = oco.get("orderListId", "?")
-        log.info(f"OCO place: {symbol} TP=${tp} SL=${sl} SL_limit=${sl_limit} (list #{oco_id})")
-        state["open_exits"][symbol] = {"oco_id": oco_id, "sl": sl, "tp": tp, "qty": qty}
+        log.info(f"OCO place: {symbol} TP=${tp} SL=${sl} (list #{oco_id})")
+        state["open_exits"][symbol] = {
+            "oco_id":      oco_id,
+            "sl":          sl,
+            "tp":          tp,
+            "qty":         qty,
+            "entry_price": entry_price,
+        }
         return oco_id
     except BinanceAPIException as e:
         log.error(f"Erreur OCO {symbol}: {e.message}")
         return None
+
+
+def sync_open_positions():
+    """Retire de open_exits les OCO clos (TP ou SL declenche) et met a jour loss_streak."""
+    to_remove = []
+    for sym, info in list(state["open_exits"].items()):
+        oco_id = info.get("oco_id")
+        if not oco_id:
+            continue
+        try:
+            oco    = binance.get_order_list(orderListId=int(oco_id))
+            status = oco.get("listOrderStatus", "")
+            if status not in ("ALL_DONE", "RESPONSE"):
+                continue
+            # OCO fini — chercher l'ordre FILLED pour savoir SL ou TP
+            for ord_ref in oco.get("orders", []):
+                try:
+                    detail    = binance.get_order(symbol=sym, orderId=ord_ref["orderId"])
+                    ord_type  = detail.get("type", "")
+                    ord_st    = detail.get("status", "")
+                    if ord_st != "FILLED":
+                        continue
+                    fill_px   = float(detail.get("price", 0) or detail.get("cummulativeQuoteQty", 0))
+                    entry_px  = info.get("entry_price", fill_px)
+                    sl_px     = info.get("sl", 0)
+                    if fill_px and fill_px <= sl_px * 1.002:  # ±0.2% = SL
+                        state["loss_streak"] = state.get("loss_streak", 0) + 1
+                        pnl = (fill_px - entry_px) / entry_px * 100 if entry_px else 0
+                        log.warning(f"SL {sym} @ ${fill_px:.4g} | PnL {pnl:+.2f}% | streak {state['loss_streak']}")
+                        send_telegram(f"SL *{sym}* @ `${fill_px:.4g}` | PnL `{pnl:+.2f}%`")
+                    else:
+                        state["loss_streak"] = 0
+                        pnl = (fill_px - entry_px) / entry_px * 100 if entry_px else 0
+                        log.info(f"TP {sym} @ ${fill_px:.4g} | PnL {pnl:+.2f}%")
+                        send_telegram(f"TP *{sym}* @ `${fill_px:.4g}` | PnL `{pnl:+.2f}%`")
+                    break
+                except Exception:
+                    pass
+            to_remove.append(sym)
+        except Exception as e:
+            log.warning(f"sync OCO check {sym}: {e}")
+
+    for sym in to_remove:
+        del state["open_exits"][sym]
+    if to_remove:
+        log.info(f"Positions fermees: {', '.join(to_remove)}")
 
 
 # ─── EXECUTION ────────────────────────────────────────────────
@@ -792,7 +858,7 @@ def execute_trade(decision: dict, context: dict):
 
         # Placement OCO si SL + TP definis
         if sl and tp:
-            oco_id = place_exit_orders(symbol, qty, sl, tp)
+            oco_id = place_exit_orders(symbol, qty, sl, tp, entry_price=fill_price)
             if oco_id:
                 trade_log["oco_id"] = oco_id
                 save_trade_log(trade_log)  # mise a jour avec l'id OCO
@@ -872,12 +938,12 @@ def check_daily_loss():
 
 # ─── BOUCLE PRINCIPALE ────────────────────────────────────────
 def run_bot():
-    log.info(f"Bot demarre — Mode Multi-Crypto (Top {TOP_SYMBOLS_N} USDT)")
+    log.info("Bot demarre — Mode TOUS ACTIFS Binance USDT")
     send_telegram(
-        f"*Bot demarre*\n"
-        f"Mode: {'TESTNET' if TESTNET else 'LIVE'}\n"
-        f"Cryptos: Top {TOP_SYMBOLS_N} paires USDT\n"
-        f"Sources: TradingView + Binance + Fear&Greed"
+        f"*Bot demarre v4.1*\n"
+        f"Mode: {'TESTNET' if TESTNET else 'LIVE'} | Univers: toutes paires USDT\n"
+        f"Max positions: {MAX_OPEN_POSITIONS} | Taille/trade: {int(MAX_TRADE_PCT*100)}%\n"
+        f"Sources: TradingView + Binance Futures + Fear&Greed"
         + (f" + X/Twitter" if TWITTER_BEARER else "")
     )
     state["daily_start_balance"] = min(get_balance(), CAPITAL_LIMIT_USDT)
@@ -887,42 +953,62 @@ def run_bot():
         try:
             check_daily_reset()
             check_daily_loss()
+            sync_open_positions()
 
+            # Gestion de la pause
             if state["paused"]:
-                log.info("Bot en pause — daily loss cap atteint")
+                if time.time() < state.get("paused_until", 0):
+                    remaining = int((state["paused_until"] - time.time()) / 60)
+                    log.info(f"Bot en pause — {remaining} min restantes")
+                else:
+                    state["paused"] = False
+                    log.info("Pause terminee — reprise du scan")
                 time.sleep(SCAN_INTERVAL)
                 continue
 
-            symbols = get_top_symbols(TOP_SYMBOLS_N)
+            # Max positions ouvertes atteint
+            n_open = len(state["open_exits"])
+            if n_open >= MAX_OPEN_POSITIONS:
+                log.info(f"Max positions ({n_open}/{MAX_OPEN_POSITIONS}) — en attente de fermeture")
+                time.sleep(SCAN_INTERVAL)
+                continue
+
+            # Univers de paires + signaux TV (avec cache 5min)
+            symbols = get_all_symbols()
             state["scanning_symbols"] = symbols
 
             now_ts = time.time()
             if now_ts - state["last_tv_update"] > TV_CACHE_SECS:
-                log.info(f"Refresh TradingView ({len(symbols)} paires)...")
+                nb = max(1, len(symbols) // 100 + 1)
+                log.info(f"Refresh TradingView ({len(symbols)} paires en {nb} batches)...")
                 tv = get_tv_signals(symbols)
                 state["tv_signals"]     = tv
                 state["last_tv_update"] = now_ts
             else:
                 tv = state["tv_signals"]
 
-            candidates = [
+            # Candidats BUY uniquement, excluant les positions deja ouvertes
+            already_held = set(state["open_exits"].keys())
+            candidates   = [
                 (sym, tv.get(sym, {}).get("rec_all", 0) or 0)
                 for sym in symbols
-                if abs(tv.get(sym, {}).get("rec_all", 0) or 0) > 0.15
+                if sym not in already_held
+                and (tv.get(sym, {}).get("rec_all", 0) or 0) > 0.15
             ]
-            candidates.sort(key=lambda x: abs(x[1]), reverse=True)
-            top3 = candidates[:3]
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            top_cands = candidates[:TOP_CANDIDATES]
 
-            if not top3:
-                log.info("Aucun signal TV fort detecte — HOLD ce cycle")
+            if not top_cands:
+                log.info(f"Aucun signal BUY fort ({len(symbols)} paires scannees) — HOLD")
                 time.sleep(SCAN_INTERVAL)
                 continue
 
-            log.info(f"Candidats: {', '.join(f'{s}({r:+.2f})' for s, r in top3)}")
-            state["current_scan"] = top3[0][0]
+            log.info(f"Top candidats: {', '.join(f'{s}({r:+.2f})' for s, r in top_cands)}")
+            state["current_scan"] = top_cands[0][0]
 
+            # Contexte detaille pour chaque candidat
             contexts = []
-            for sym, rec in top3:
+            for sym, rec in top_cands:
                 try:
                     ctx                      = get_market_context(sym)
                     ctx["tv_recommendation"] = rec
@@ -936,21 +1022,25 @@ def run_bot():
                 time.sleep(SCAN_INTERVAL)
                 continue
 
+            # Décision IA
             decision = ask_ai_multi(contexts)
             symbol   = decision.get("symbol", "NONE")
 
             if symbol == "NONE" or decision.get("action") == "HOLD":
-                log.info(f"HOLD — {decision.get('reasoning', '')}")
+                log.info(f"IA HOLD — {decision.get('reasoning', '')}")
             else:
                 ctx = next((c for c in contexts if c["symbol"] == symbol), contexts[0])
                 approved, reason = risk_gate(decision, ctx)
                 if not approved:
                     log.info(f"Risk Gate refus: {reason}")
-                    if decision.get("confidence", 0) >= 0.55:
-                        send_telegram(f"*Trade refuse (Risk Gate)*\n{reason}")
+                    if decision.get("confidence", 0) >= MIN_CONFIDENCE:
+                        send_telegram(f"*Trade refuse*\n{symbol}: {reason}")
                 else:
                     execute_trade(decision, ctx)
 
+        except KeyboardInterrupt:
+            log.info("Arret manuel du bot")
+            break
         except Exception as e:
             log.error(f"Erreur boucle principale: {e}")
             traceback.print_exc()
@@ -1005,17 +1095,26 @@ def status():
         balance = min(get_balance(), CAPITAL_LIMIT_USDT)
     except:
         balance = None
+    n_universe = len(state["scanning_symbols"])
+    n_open     = len(state["open_exits"])
+    pause_left = max(0, int((state.get("paused_until", 0) - time.time()) / 60))
     return jsonify({
-        "status":        "paused" if state["paused"] else "running",
-        "testnet":       TESTNET,
-        "symbol":        f"MULTI-CRYPTO ({TOP_SYMBOLS_N} paires)",
-        "daily_pnl_pct": round(state["daily_pnl"] * 100, 2),
-        "trades_today":  len(state["trades_today"]),
-        "balance_usdt":  balance,
-        "capital_limit": CAPITAL_LIMIT_USDT,
-        "last_signal":   state["last_signal"],
-        "scanning":      state["scanning_symbols"][:5],
-        "current_scan":  state["current_scan"],
+        "status":          "paused" if state["paused"] else "running",
+        "pause_min_left":  pause_left if state["paused"] else 0,
+        "testnet":         TESTNET,
+        "universe_size":   n_universe,
+        "symbol":          f"ALL USDT ({n_universe} paires)",
+        "daily_pnl_pct":   round(state["daily_pnl"] * 100, 2),
+        "trades_today":    len(state["trades_today"]),
+        "open_positions":  n_open,
+        "max_positions":   MAX_OPEN_POSITIONS,
+        "open_symbols":    list(state["open_exits"].keys()),
+        "balance_usdt":    balance,
+        "capital_limit":   CAPITAL_LIMIT_USDT,
+        "last_signal":     state["last_signal"],
+        "scanning":        state["scanning_symbols"][:8],
+        "current_scan":    state["current_scan"],
+        "loss_streak":     state.get("loss_streak", 0),
     })
 
 @app.route("/logs")
