@@ -1324,10 +1324,65 @@ def check_daily_loss():
                 send_telegram(msg)
 
 # ─── BOUCLE PRINCIPALE ────────────────────────────────────────
+def recover_open_positions():
+    """Au démarrage, relit les ordres OCO Binance ouverts et reconstruit open_exits."""
+    try:
+        open_orders = binance.get_open_orders()
+        if not open_orders:
+            return
+        # Grouper par orderListId pour retrouver les OCO
+        oco_map = {}  # listId -> {symbol, orders[]}
+        for o in open_orders:
+            lid = o.get("orderListId", -1)
+            if lid == -1:
+                continue
+            sym = o["symbol"]
+            if lid not in oco_map:
+                oco_map[lid] = {"symbol": sym, "orders": [], "sl": None, "tp": None}
+            oco_map[lid]["orders"].append(o)
+            if o["type"] in ("STOP_LOSS_LIMIT", "STOP_LOSS"):
+                oco_map[lid]["sl"] = float(o.get("stopPrice") or o.get("price") or 0)
+            elif o["type"] in ("LIMIT_MAKER", "LIMIT"):
+                oco_map[lid]["tp"] = float(o.get("price") or 0)
+
+        recovered = 0
+        for lid, info in oco_map.items():
+            sym = info["symbol"]
+            if sym in state["open_exits"]:
+                continue  # déjà connu
+            # Chercher le prix d'entrée dans trades.json
+            entry_px = 0.0
+            try:
+                with open(TRADES_FILE) as f:
+                    trades_hist = json.load(f)
+                # Dernier trade BUY pour ce symbole sans outcome
+                for t in reversed(trades_hist):
+                    if t.get("symbol") == sym and t.get("action") == "BUY" and not t.get("outcome"):
+                        entry_px = float(t.get("entry_price") or 0)
+                        break
+            except Exception:
+                pass
+            state["open_exits"][sym] = {
+                "oco_id":      lid,
+                "sl":          info["sl"] or 0,
+                "tp":          info["tp"] or 0,
+                "qty":         float(info["orders"][0].get("origQty", 0)),
+                "entry_price": entry_px,
+                "is_short":    False,
+            }
+            recovered += 1
+            log.info(f"Récupéré position ouverte: {sym} OCO#{lid} SL={info['sl']} TP={info['tp']}")
+
+        if recovered:
+            log.info(f"Récupération: {recovered} position(s) rechargée(s) depuis Binance")
+    except Exception as e:
+        log.warning(f"Récupération positions: {e}")
+
+
 def run_bot():
     log.info("Bot demarre — Mode TOUS ACTIFS Binance USDT")
     send_telegram(
-        f"*Bot demarre v4.1*\n"
+        f"*Bot demarre v5.0*\n"
         f"Mode: {'TESTNET' if TESTNET else 'LIVE'} | Univers: toutes paires USDT\n"
         f"Max positions: {MAX_OPEN_POSITIONS} | Taille/trade: {int(MAX_TRADE_PCT*100)}%\n"
         f"Sources: TradingView + Binance Futures + Fear&Greed"
@@ -1335,6 +1390,7 @@ def run_bot():
     )
     state["daily_start_balance"] = min(get_balance(), CAPITAL_LIMIT_USDT)
     log.info(f"Balance de depart: ${state['daily_start_balance']:.2f} USDT (cap: ${CAPITAL_LIMIT_USDT})")
+    recover_open_positions()  # Recharge les positions ouvertes depuis Binance
 
     while True:
         try:
