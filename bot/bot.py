@@ -74,7 +74,7 @@ if TELEGRAM_CHAT_ID and "COLLE" in TELEGRAM_CHAT_ID:
     TELEGRAM_CHAT_ID = ""
 
 # Parametres de risque
-MAX_TRADE_PCT         = 0.10
+MAX_TRADE_PCT         = 0.05    # 5% = ~$50 par trade sur $1000
 DAILY_LOSS_CAP        = 0.05    # Pause si -5% dans la journee
 CAPITAL_LIMIT_USDT    = float(os.getenv("CAPITAL_LIMIT_USDT", "1000"))
 MAX_DAILY_TRADES      = int(os.getenv("MAX_DAILY_TRADES", "20"))
